@@ -485,8 +485,9 @@ def cmd_show(db, args):
     print(col(p["path"], "dim"))
     print(f"Activity: {heat(days)} {ago(days)}  ·  {info['commits']} commits"
           + (col(f"  ·  {info['dirty']} uncommitted files", "y") if info["dirty"] else ""))
-    print(f"Why:      {p.get('why') or col('(not set — pm why ' + name + ' \"...\")', 'dim')}")
-    print(f"Next:     {col(p['next'], 'c') if p.get('next') else col('(not set — pm next ' + name + ' \"...\")', 'dim')}")
+    unset = lambda cmd: col(f'(not set — pm {cmd} {name} "...")', "dim")
+    print(f"Why:      {p.get('why') or unset('why')}")
+    print(f"Next:     {col(p['next'], 'c') if p.get('next') else unset('next')}")
     if p.get("leftoff"):
         print(f"Left off: {p['leftoff']}")
     rel = roadmap_file(p)
