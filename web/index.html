@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Project Board</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect x='1' y='9' width='3' height='6' rx='1' fill='%235b9bf0'/><rect x='6.5' y='5' width='3' height='10' rx='1' fill='%235b9bf0'/><rect x='12' y='1' width='3' height='14' rx='1' fill='%235b9bf0'/></svg>">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="wrap">
+    <header class="top">
+      <div>
+        <h1>Projects</h1>
+        <p class="sub" id="sub">Loading…</p>
+      </div>
+      <div class="actions">
+        <label class="search">
+          <input type="search" id="filter" placeholder="Filter projects" aria-label="Filter projects">
+          <span class="kbd" aria-hidden="true">/</span>
+        </label>
+        <button id="refresh" class="btn primary">Sync GitHub</button>
+      </div>
+    </header>
+
+    <main id="app" aria-live="polite">
+      <div class="loading">Reading your repos and GitHub issues…</div>
+    </main>
+  </div>
+
+  <dialog id="detail" aria-labelledby="detail-title"></dialog>
+  <div id="tip" role="tooltip" hidden></div>
+  <div id="toast" role="status" hidden></div>
+
+  <script src="app.js"></script>
+</body>
+</html>
