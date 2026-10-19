@@ -83,9 +83,13 @@ def log(p, note):
 
 # ---------- discovery & activity ----------
 
+# Under pythonw (background board) every child process would flash a console window on Windows.
+NO_WINDOW = {"creationflags": 0x08000000} if os.name == "nt" else {}  # CREATE_NO_WINDOW
+
+
 def git(path, *args):
     try:
-        out = subprocess.run(["git", "-C", path, *args], capture_output=True, encoding="utf-8", errors="replace", timeout=10)
+        out = subprocess.run(["git", "-C", path, *args], capture_output=True, encoding="utf-8", errors="replace", timeout=10, **NO_WINDOW)
         return out.stdout.strip() if out.returncode == 0 else ""
     except (OSError, subprocess.TimeoutExpired):
         return ""
@@ -265,7 +269,7 @@ def start_idea(db, query, path=None):
     created = not os.path.exists(path)
     if created:
         os.makedirs(path)
-        subprocess.run(["git", "init", "-q", path], check=False)
+        subprocess.run(["git", "init", "-q", path], check=False, **NO_WINDOW)
         pitch = f"\n> {idea['pitch']}\n" if idea["pitch"] else ""
         with open(os.path.join(path, "ROADMAP.md"), "w", encoding="utf-8") as f:
             f.write(f"# {idea['title']}\n{pitch}\n## MVP\n"
@@ -656,7 +660,7 @@ def fetch_github(slug):
     try:
         out = subprocess.run(["gh", "api", "graphql", "-f", f"query={GH_QUERY}",
                               "-f", f"owner={owner}", "-f", f"name={name}"],
-                             capture_output=True, encoding="utf-8", errors="replace", timeout=30)
+                             capture_output=True, encoding="utf-8", errors="replace", timeout=30, **NO_WINDOW)
     except (OSError, subprocess.TimeoutExpired) as e:
         return {"error": str(e)}
     if out.returncode != 0:
@@ -1076,6 +1080,8 @@ def cmd_serve(db, args):
                 else:
                     self.send(*update_project(unquote(m[1]), body))
 
+    # On Windows SO_REUSEADDR lets a second server bind a port that's already in use.
+    ThreadingHTTPServer.allow_reuse_address = os.name != "nt"
     url = f"http://localhost:{port}"
     try:
         server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
@@ -1193,7 +1199,7 @@ def board_running(port):
         return s.connect_ex(("127.0.0.1", port)) == 0
 
 
-DETACH = {"creationflags": 0x08000000} if os.name == "nt" else {"start_new_session": True}  # CREATE_NO_WINDOW
+DETACH = NO_WINDOW if os.name == "nt" else {"start_new_session": True}
 
 
 def spawn(argv):
