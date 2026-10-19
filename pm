@@ -7,6 +7,7 @@ what's in focus, why it matters, and the very next step.
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -34,9 +35,15 @@ DEFAULTS = {
 ACTIVE_DAYS, COOLING_DAYS = 7, 21
 STATUSES = ("active", "parked", "done", "dropped")
 
+if os.name == "nt":
+    os.system("")  # turns on ANSI colors in the classic Windows console
+# pythonw (Windows autostart) has no console at all: sys.stdout is None.
+if sys.stdout and (sys.stdout.encoding or "").lower().replace("-", "") != "utf8":
+    sys.stdout.reconfigure(errors="replace")  # ★ and → on a non-UTF-8 console or locale
+
 C = {"r": "\033[31m", "g": "\033[32m", "y": "\033[33m", "b": "\033[34m",
      "m": "\033[35m", "c": "\033[36m", "dim": "\033[2m", "bold": "\033[1m", "x": "\033[0m"}
-if not sys.stdout.isatty() or os.environ.get("NO_COLOR"):
+if not (sys.stdout and sys.stdout.isatty()) or os.environ.get("NO_COLOR"):
     C = {k: "" for k in C}
 
 
@@ -49,7 +56,7 @@ def col(text, *styles):
 def load():
     if not os.path.exists(DATA):
         return json.loads(json.dumps(DEFAULTS))
-    with open(DATA) as f:
+    with open(DATA, encoding="utf-8") as f:
         db = json.load(f)
     for k, v in DEFAULTS.items():
         db.setdefault(k, json.loads(json.dumps(v)))
@@ -58,7 +65,7 @@ def load():
 
 def save(db):
     tmp = DATA + ".tmp"
-    with open(tmp, "w") as f:
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(db, f, indent=2, ensure_ascii=False)
         f.write("\n")
     os.replace(tmp, DATA)
@@ -76,7 +83,7 @@ def log(p, note):
 
 def git(path, *args):
     try:
-        out = subprocess.run(["git", "-C", path, *args], capture_output=True, text=True, timeout=10)
+        out = subprocess.run(["git", "-C", path, *args], capture_output=True, encoding="utf-8", errors="replace", timeout=10)
         return out.stdout.strip() if out.returncode == 0 else ""
     except (OSError, subprocess.TimeoutExpired):
         return ""
@@ -197,7 +204,13 @@ def idea_view(db, idea):
     age = (date.today() - date.fromisoformat(idea["added"])).days
     left = max(0, db["idea_cooldown_days"] - age)
     return {**idea, "age": age, "daysLeft": left, "ready": left == 0,
-            "defaultPath": idea_path(db, idea["title"]).replace(os.path.expanduser("~"), "~", 1)}
+            "defaultPath": tilde(idea_path(db, idea["title"]))}
+
+
+def tilde(path):
+    """~/... for paths under home, on any OS."""
+    home = os.path.expanduser("~")
+    return "~" + path[len(home):] if path == home or path.startswith(home + os.sep) else path
 
 
 def idea_path(db, title):
@@ -252,7 +265,7 @@ def start_idea(db, query, path=None):
         os.makedirs(path)
         subprocess.run(["git", "init", "-q", path], check=False)
         pitch = f"\n> {idea['pitch']}\n" if idea["pitch"] else ""
-        with open(os.path.join(path, "ROADMAP.md"), "w") as f:
+        with open(os.path.join(path, "ROADMAP.md"), "w", encoding="utf-8") as f:
             f.write(f"# {idea['title']}\n{pitch}\n## MVP\n"
                     "- [ ] Write down what \"done\" means for the MVP\n"
                     "- [ ] Build the smallest slice you can show someone\n")
@@ -640,7 +653,7 @@ def fetch_github(slug):
     try:
         out = subprocess.run(["gh", "api", "graphql", "-f", f"query={GH_QUERY}",
                               "-f", f"owner={owner}", "-f", f"name={name}"],
-                             capture_output=True, text=True, timeout=30)
+                             capture_output=True, encoding="utf-8", errors="replace", timeout=30)
     except (OSError, subprocess.TimeoutExpired) as e:
         return {"error": str(e)}
     if out.returncode != 0:
@@ -650,7 +663,7 @@ def fetch_github(slug):
 
 def read_gh_cache():
     try:
-        with open(GH_CACHE) as f:
+        with open(GH_CACHE, encoding="utf-8") as f:
             return json.load(f)
     except (OSError, ValueError):
         return {}
@@ -680,7 +693,7 @@ def github_all(slugs, refresh=False, background=False):
                         continue  # keep the last good copy
                     cache[slug] = {"at": now, "data": data}
             os.makedirs(os.path.dirname(GH_CACHE), exist_ok=True)
-            with open(GH_CACHE, "w") as f:
+            with open(GH_CACHE, "w", encoding="utf-8") as f:
                 json.dump(cache, f)
         return {s: cache[s] for s in slugs if s in cache}
 
@@ -760,7 +773,7 @@ def summarize_github(raw):
 # For projects without GitHub issues: a markdown checklist in the repo.
 # Headings are milestones, `- [ ]` / `- [x]` items are tasks.
 
-ROADMAP_FILES = ("ROADMAP.md", "TODO.md", "docs/roadmap.md", "docs/ROADMAP.md", "docs/TODO.md")
+ROADMAP_FILES = ("ROADMAP.md", "TODO.md", "docs/ROADMAP.md", "docs/TODO.md")
 CHECKBOX = re.compile(r"^\s*[-*+]\s+\[([ xX])\]\s+(.*)$")
 HEADING = re.compile(r"^(#{1,6})\s+(.*?)\s*#*\s*$")
 
@@ -769,7 +782,17 @@ def roadmap_file(p):
     """Relative path of the project's roadmap: the configured one, else the first conventional file."""
     if p.get("roadmap"):
         return p["roadmap"] if os.path.isfile(os.path.join(p["path"], p["roadmap"])) else None
-    return next((rel for rel in ROADMAP_FILES if os.path.isfile(os.path.join(p["path"], rel))), None)
+    # Match names case-insensitively so Linux finds roadmap.md / Todo.md like macOS and Windows do.
+    for want in ROADMAP_FILES:
+        folder, _, name = want.rpartition("/")
+        try:
+            hit = next(f for f in os.listdir(os.path.join(p["path"], folder)) if f.lower() == name.lower())
+        except (OSError, StopIteration):
+            continue
+        rel = f"{folder}/{hit}" if folder else hit
+        if os.path.isfile(os.path.join(p["path"], rel)):
+            return rel
+    return None
 
 
 def clean_md(text):
@@ -914,7 +937,7 @@ def board(refresh=False):
         github = summarize_github(entry["data"]) if entry else None
         # GitHub issues win, unless a roadmap file was chosen explicitly or there are no issues.
         use_roadmap = roadmap and (p.get("roadmap") or not github or github.get("error") or not github["total"])
-        out.append({"name": n, "path": p["path"], "status": p["status"], "focus": bool(p.get("focus")),
+        out.append({"name": n, "path": p["path"], "displayPath": tilde(p["path"]), "status": p["status"], "focus": bool(p.get("focus")),
                     "next": p.get("next", ""), "why": p.get("why", ""), "blocker": p.get("blocker", ""),
                     "leftoff": p.get("leftoff", ""), "log": p.get("log", [])[-10:], "local": l,
                     "tracker": roadmap if use_roadmap else github,
@@ -985,7 +1008,10 @@ def cmd_serve(db, args):
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     import webbrowser
 
-    port = int(args[0]) if args else 4242
+    port = next((int(a) for a in args if a.isdigit()), DEFAULT_PORT)
+    if "--log" in args and args.index("--log") + 1 < len(args):
+        # Autostart runs headless: send output to a log file instead of nowhere.
+        sys.stdout = sys.stderr = open(args[args.index("--log") + 1], "a", encoding="utf-8", buffering=1)
     allowed = {f"127.0.0.1:{port}", f"localhost:{port}"}
     types = {".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".svg": "image/svg+xml"}
     write_lock = threading.Lock()
@@ -1045,9 +1071,12 @@ def cmd_serve(db, args):
                 else:
                     self.send(*update_project(unquote(m[1]), body))
 
-    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     url = f"http://localhost:{port}"
-    print(f"pm board at {col(url, 'c')}  (Ctrl+C to stop)")
+    try:
+        server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    except OSError:
+        sys.exit(f"Port {port} is already in use. If pm is already running, open {url}")
+    print(f"{datetime.now():%Y-%m-%d %H:%M}  pm board at {col(url, 'c')}  (Ctrl+C to stop)")
     if "--no-open" not in args:
         webbrowser.open(url)
     try:
@@ -1056,10 +1085,155 @@ def cmd_serve(db, args):
         print()
 
 
+# ---------- autostart ----------
+# Start `pm serve` at login using each OS's own mechanism; no admin rights needed.
+
+DEFAULT_PORT = 4242
+AUTOSTART_ID = "dev.pm.board"
+SCRIPT = os.path.realpath(__file__)
+
+
+def autostart_target():
+    """Where the login item lives on this OS: (kind, path)."""
+    home = os.path.expanduser("~")
+    if sys.platform == "darwin":
+        return "launchd", os.path.join(home, "Library", "LaunchAgents", f"{AUTOSTART_ID}.plist")
+    if os.name == "nt":
+        startup = os.path.join(os.environ.get("APPDATA", home), "Microsoft", "Windows", "Start Menu", "Programs", "Startup")
+        return "startup", os.path.join(startup, "pm-board.vbs")
+    config = os.environ.get("XDG_CONFIG_HOME") or os.path.join(home, ".config")
+    has_systemd = bool(shutil.which("systemctl")) and subprocess.run(
+        ["systemctl", "--user", "show-environment"], capture_output=True).returncode == 0
+    if has_systemd:
+        return "systemd", os.path.join(config, "systemd", "user", "pm-board.service")
+    return "xdg", os.path.join(config, "autostart", "pm-board.desktop")
+
+
+def log_path():
+    if sys.platform == "darwin":
+        return os.path.join(os.path.expanduser("~"), "Library", "Logs", "pm-board.log")
+    return os.path.join(HERE, ".cache", "pm-board.log")
+
+
+def board_running(port):
+    import socket
+    with socket.socket() as s:
+        s.settimeout(0.5)
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+
+def autostart_on(port):
+    kind, path = autostart_target()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    os.makedirs(os.path.dirname(log_path()), exist_ok=True)
+    py, log = sys.executable, log_path()
+    serve = [SCRIPT, "serve", str(port), "--no-open"]
+
+    if kind == "launchd":
+        import plistlib
+        with open(path, "wb") as f:
+            plistlib.dump({
+                "Label": AUTOSTART_ID, "ProgramArguments": [py, *serve], "RunAtLoad": True,
+                # Login items get a bare PATH; keep ours so git and gh are found.
+                "EnvironmentVariables": {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "PYTHONUNBUFFERED": "1"},
+                "StandardOutPath": log, "StandardErrorPath": log,
+            }, f)
+        domain = f"gui/{os.getuid()}"
+        subprocess.run(["launchctl", "bootout", f"{domain}/{AUTOSTART_ID}"], capture_output=True)
+        subprocess.run(["launchctl", "bootstrap", domain, path], capture_output=True)
+    elif kind == "systemd":
+        quote = lambda s: '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("[Unit]\nDescription=pm project board\n\n[Service]\n"
+                    f"ExecStart={' '.join(quote(a) for a in [py, *serve])}\n"
+                    f"Environment={quote('PATH=' + os.environ.get('PATH', '/usr/bin:/bin'))} PYTHONUNBUFFERED=1\n"
+                    "Restart=on-failure\nRestartSec=30\n\n[Install]\nWantedBy=default.target\n")
+        subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
+        subprocess.run(["systemctl", "--user", "enable", "--now", "pm-board.service"], capture_output=True)
+    elif kind == "xdg":
+        import shlex
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("[Desktop Entry]\nType=Application\nName=pm board\nNoDisplay=true\n"
+                    f"Exec={shlex.join([py, *serve, '--log', log])}\nX-GNOME-Autostart-enabled=true\n")
+        if not board_running(port):
+            subprocess.Popen([py, *serve, "--log", log], start_new_session=True,
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:  # Windows: a hidden launcher in the Startup folder, running pythonw (no console window)
+        pyw = os.path.join(os.path.dirname(py), "pythonw.exe")
+        pyw = pyw if os.path.exists(pyw) else py
+        cmd = " ".join(f'""{a}""' for a in [pyw, *serve, "--log", log])
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(f'CreateObject("WScript.Shell").Run "{cmd}", 0, False\n')
+        if not board_running(port):
+            subprocess.Popen([pyw, *serve, "--log", log], creationflags=0x08000000,  # CREATE_NO_WINDOW
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return kind, path
+
+
+def autostart_off():
+    kind, path = autostart_target()
+    if kind == "launchd":
+        subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{AUTOSTART_ID}"], capture_output=True)
+    elif kind == "systemd":
+        subprocess.run(["systemctl", "--user", "disable", "--now", "pm-board.service"], capture_output=True)
+    existed = os.path.exists(path)
+    if existed:
+        os.remove(path)
+    if kind == "systemd":
+        subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
+    return kind, path, existed
+
+
+def autostart_port(path):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            m = re.search(r"serve\D{0,30}(\d+)", f.read())
+        return int(m[1]) if m else DEFAULT_PORT
+    except OSError:
+        return DEFAULT_PORT
+
+
+def cmd_autostart(db, args):
+    action = args[0] if args else "status"
+    port = next((int(a) for a in args[1:] if a.isdigit()), DEFAULT_PORT)
+    names = {"launchd": "macOS LaunchAgent", "systemd": "systemd user service",
+             "xdg": "desktop autostart entry", "startup": "Windows Startup folder"}
+    if action == "on":
+        was_running = board_running(port)
+        kind, path = autostart_on(port)
+        print(col(f"✓ The board now starts at login", "g") + f" ({names[kind]}).")
+        print(col(f"  {tilde(path)}", "dim"))
+        time.sleep(1.5)
+        if board_running(port):
+            print(f"  Open http://localhost:{port}, and bookmark it." +
+                  (col("\n  (A board was already running on this port; the login item takes over from next login.)", "dim")
+                   if was_running else ""))
+        else:
+            print(col(f"  It didn't come up yet; check the log: {tilde(log_path())}", "y"))
+    elif action == "off":
+        kind, path, existed = autostart_off()
+        print(f"Autostart is off ({names[kind]} removed)." if existed else "Autostart wasn't on.")
+        if existed and kind in ("xdg", "startup") and board_running(port):
+            print(col("  The board that's running now stops when you log out.", "dim"))
+    elif action == "status":
+        kind, path = autostart_target()
+        on = os.path.exists(path)
+        p = autostart_port(path) if on else port
+        print(f"Autostart: {col('on', 'g') if on else col('off', 'dim')}  ({names[kind]}{', ' + tilde(path) if on else ''})")
+        print(f"Board:     {col(f'running at http://localhost:{p}', 'g') if board_running(p) else col('not running', 'dim')}")
+        if on:
+            print(col(f"Log:       {tilde(log_path())}", "dim"))
+        else:
+            print(col("Turn it on with: pm autostart on", "dim"))
+    else:
+        sys.exit("usage: pm autostart [on [port] | off | status]")
+
+
 HELP = """pm — keep your projects from quietly dying
 
   pm                      the board: focus, in motion, stalled
   pm serve [port]         the web board (default http://localhost:4242)
+  pm autostart [on|off]   start the web board at login (macOS, Linux, Windows)
   pm review               triage stalled projects one by one (do this weekly)
   pm idea "..." ["why"]   park a new project idea; it can start after a 7-day cooldown
   pm ideas [--all]        the idea inbox
@@ -1090,7 +1264,7 @@ COMMANDS = {
     "next": cmd_text("next", "next"), "why": cmd_text("why", "why"), "note": cmd_note,
     "block": cmd_text("blocker", "blocker"), "unblock": cmd_unblock, "serve": cmd_serve,
     "roadmap": cmd_roadmap, "leftoff": cmd_text("leftoff", "left off"),
-    "idea": cmd_idea, "ideas": cmd_ideas,
+    "idea": cmd_idea, "ideas": cmd_ideas, "autostart": cmd_autostart,
     "park": set_status("parked", "park"), "drop": set_status("dropped", "drop"),
     "done": set_status("done", "done"), "revive": set_status("active", "revive"),
     "show": cmd_show, "list": cmd_list, "add": cmd_add, "root": cmd_root, "ignore": cmd_ignore,
@@ -1099,7 +1273,8 @@ DB_REF = [None]
 
 
 def main():
-    args = sys.argv[1:]
+    # Under a non-UTF-8 locale, POSIX hands us undecodable bytes as surrogates; recover them as UTF-8.
+    args = [os.fsencode(a).decode("utf-8", "replace") if os.name != "nt" else a for a in sys.argv[1:]]
     if args and args[0] in ("-h", "--help", "help"):
         print(HELP)
         return

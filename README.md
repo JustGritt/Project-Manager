@@ -4,9 +4,11 @@ A project manager for people who start a lot of projects and finish few of them.
 
 `pm` finds your projects on disk, reads their activity from git and their progress from GitHub issues or a markdown checklist, and asks you for only three things: what's in focus (max 3), the very next step, and where you left off.
 
-No dependencies: Python 3 standard library, `git`, and optionally the [GitHub CLI](https://cli.github.com/) (`gh`) for issues.
+No dependencies: Python 3.8+ standard library, `git` 2.21+, and optionally the [GitHub CLI](https://cli.github.com/) (`gh`) for issues. Works on macOS, Linux and Windows.
 
 ## Setup
+
+macOS / Linux:
 
 ```sh
 git clone git@github.com:JustGritt/Project-Manager.git
@@ -14,6 +16,16 @@ ln -s "$PWD/Project-Manager/pm" ~/.local/bin/pm   # any directory on your PATH
 gh auth login                                     # optional, for GitHub issues
 pm                                                # first run discovers your projects
 ```
+
+Windows (PowerShell, with Python and Git for Windows installed):
+
+```powershell
+git clone git@github.com:JustGritt/Project-Manager.git
+# Add the Project-Manager folder to your PATH (or copy pm.cmd somewhere on it), then:
+pm
+```
+
+`pm.cmd` runs `python pm` for you; `python pm <command>` works too.
 
 Projects are discovered in `~`, `~/orca` and `~/orca/projects` by default (any folder with `.git`, `project.godot`, `ProjectSettings`, `package.json`, `Cargo.toml` or `pyproject.toml`). Add more with `pm root <dir>`.
 
@@ -30,6 +42,16 @@ pm serve          # http://localhost:4242
 - **Details panel:** full roadmap, what's left in the current milestone, blockers, decisions, commits and journal.
 
 The server only listens on `127.0.0.1` and rejects requests from other origins.
+
+### Start it at login
+
+```sh
+pm autostart on       # then bookmark http://localhost:4242
+pm autostart status
+pm autostart off
+```
+
+Uses each system's own login mechanism, no admin rights needed: a LaunchAgent on macOS (log in `~/Library/Logs/pm-board.log`), a systemd user service on Linux (or a desktop autostart entry where systemd isn't available), and a hidden launcher in the Startup folder on Windows.
 
 ## Idea inbox
 

@@ -567,7 +567,7 @@ function renderDetail() {
         <button class="close-x" data-act="close" aria-label="Close">×</button>
       </div>
       <div class="d-meta">
-        <span>${esc(p.path.replace(/^\/Users\/[^/]+/, '~'))}</span>
+        <span>${esc(p.displayPath)}</span>
         ${p.repoUrl ? `<a href="${esc(p.repoUrl)}" target="_blank" rel="noopener">${esc(p.local.slug)} ↗</a>` : ''}
         <span>${plural(p.local.commits, 'commit')}</span>
         ${p.local.dirty ? `<span>${p.local.dirty} uncommitted</span>` : ''}
