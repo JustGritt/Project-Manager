@@ -26,7 +26,9 @@ DEFAULTS = {
     "roots": ["~", "~/orca", "~/orca/projects"],
     "ignore": ["Temp", "Project-Manager", "Library", "Applications"],
     "focus_limit": 3,
+    "idea_cooldown_days": 7,
     "projects": {},
+    "ideas": [],
 }
 
 ACTIVE_DAYS, COOLING_DAYS = 7, 21
@@ -50,7 +52,7 @@ def load():
     with open(DATA) as f:
         db = json.load(f)
     for k, v in DEFAULTS.items():
-        db.setdefault(k, v)
+        db.setdefault(k, json.loads(json.dumps(v)))
     return db
 
 
@@ -187,6 +189,84 @@ def try_focus(db, name):
     return None
 
 
+# ---------- idea inbox ----------
+# New ideas wait out a cooldown before they can become projects, and only
+# start when a focus slot is free. Most lose their shine while waiting.
+
+def idea_view(db, idea):
+    age = (date.today() - date.fromisoformat(idea["added"])).days
+    left = max(0, db["idea_cooldown_days"] - age)
+    return {**idea, "age": age, "daysLeft": left, "ready": left == 0,
+            "defaultPath": idea_path(db, idea["title"]).replace(os.path.expanduser("~"), "~", 1)}
+
+
+def idea_path(db, title):
+    folder = re.sub(r"[^A-Za-z0-9_-]+", "-", title).strip("-") or "new-project"
+    root = next((r for r in db["roots"] if r.rstrip("/").endswith("projects")), db["roots"][-1])
+    return os.path.join(os.path.expanduser(root), folder)
+
+
+def find_idea(db, query):
+    waiting = [i for i in db["ideas"] if i["status"] == "waiting"]
+    q = str(query).lower()
+    hits = [i for i in waiting if str(i["id"]) == q] or [i for i in waiting if i["title"].lower().startswith(q)]
+    if len(hits) != 1:
+        raise ValueError(f"No waiting idea matches '{query}'." if not hits else f"'{query}' matches several ideas.")
+    return hits[0]
+
+
+def add_idea(db, title, pitch=""):
+    title = title.strip()
+    if not title:
+        raise ValueError("An idea needs a title.")
+    idea = {"id": max((i["id"] for i in db["ideas"]), default=0) + 1, "title": title,
+            "pitch": pitch.strip(), "added": today(), "status": "waiting"}
+    db["ideas"].append(idea)
+    return idea
+
+
+def drop_idea(db, query, note=""):
+    idea = find_idea(db, query)
+    idea.update(status="dropped", closed=today(), note=note.strip())
+    return idea
+
+
+def start_idea(db, query, path=None):
+    """Turn a ready idea into a focused project: folder, git repo and a starter ROADMAP.md."""
+    idea = find_idea(db, query)
+    view = idea_view(db, idea)
+    if not view["ready"]:
+        raise ValueError(f"'{idea['title']}' is still cooling off: ready in {plural(view['daysLeft'], 'day')}.")
+    focused = [n for n, p in db["projects"].items() if p.get("focus")]
+    if len(focused) >= db["focus_limit"]:
+        raise ValueError(f"Focus is full ({', '.join(focused)}). Finish, park or unfocus one first: "
+                         "a new project should take a free slot, not a fourth one.")
+    path = os.path.abspath(os.path.expanduser(path.strip())) if path and path.strip() else idea_path(db, idea["title"])
+    name = os.path.basename(path)
+    if name in db["projects"]:
+        raise ValueError(f"A project named {name} already exists.")
+    if os.path.exists(path) and not os.path.isdir(path):
+        raise ValueError(f"{path} exists and is not a folder.")
+    created = not os.path.exists(path)
+    if created:
+        os.makedirs(path)
+        subprocess.run(["git", "init", "-q", path], check=False)
+        pitch = f"\n> {idea['pitch']}\n" if idea["pitch"] else ""
+        with open(os.path.join(path, "ROADMAP.md"), "w") as f:
+            f.write(f"# {idea['title']}\n{pitch}\n## MVP\n"
+                    "- [ ] Write down what \"done\" means for the MVP\n"
+                    "- [ ] Build the smallest slice you can show someone\n")
+    db["projects"][name] = {"path": path, "status": "active", "focus": True, "next": "", "why": idea["pitch"],
+                            "added": today(), "log": [{"date": idea["added"], "note": f"idea: {idea['title']}"},
+                                                      {"date": today(), "note": "started from the idea inbox"}]}
+    idea.update(status="started", closed=today(), project=name)
+    return name, path, created
+
+
+def plural(n, word):
+    return f"{n} {word}{'' if n == 1 else 's'}"
+
+
 def need(args, n, usage):
     if len(args) < n:
         sys.exit(f"usage: pm {usage}")
@@ -241,6 +321,11 @@ def cmd_status(db, args):
     parts = [f"{s} {len(v)}" for s, v in shelved.items() if v]
     if parts:
         print(col("\nSHELF  ", "bold") + col(" · ".join(parts) + "   (pm list to see them)", "dim"))
+    waiting = [idea_view(db, i) for i in db["ideas"] if i["status"] == "waiting"]
+    if waiting:
+        ready = sum(i["ready"] for i in waiting)
+        print(col("IDEAS  ", "bold") + col(f"{len(waiting)} waiting" + (f" · {ready} ready" if ready else "")
+                                           + "   (pm ideas)", "dim"))
 
     tips = []
     if len(warm) + len(focus) > limit:
@@ -312,6 +397,42 @@ def cmd_unblock(db, args):
     log(p, "unblocked")
     save(db)
     print(f"{name} is unblocked.")
+
+
+def cmd_idea(db, args):
+    need(args, 1, 'idea "title" ["why it\'s exciting"]  |  idea start <id> [path]  |  idea drop <id> [note]')
+    try:
+        if args[0] == "start" and len(args) > 1:
+            name, path, created = start_idea(db, args[1], args[2] if len(args) > 2 else None)
+            save(db)
+            print(col(f"★ {name} started and in focus.", "m") + f"  {path}" + (" (new repo + ROADMAP.md)" if created else ""))
+        elif args[0] == "drop" and len(args) > 1:
+            idea = drop_idea(db, args[1], " ".join(args[2:]))
+            save(db)
+            print(f"Let go of '{idea['title']}'. That's a project you'll never have to abandon.")
+        else:
+            idea = add_idea(db, args[0], " ".join(args[1:]))
+            save(db)
+            print(f"Parked idea #{idea['id']}: {idea['title']}. It can become a project in "
+                  f"{plural(db['idea_cooldown_days'], 'day')}, if you still want it.")
+    except ValueError as e:
+        sys.exit(col(str(e), "r"))
+
+
+def cmd_ideas(db, args):
+    ideas = [idea_view(db, i) for i in db["ideas"] if i["status"] == "waiting"]
+    if not ideas:
+        print('No ideas waiting. Next time inspiration strikes: pm idea "..."')
+    for i in sorted(ideas, key=lambda i: i["daysLeft"]):
+        when = col("ready", "g") if i["ready"] else col(f"ready in {plural(i['daysLeft'], 'day')}", "dim")
+        print(f"  #{i['id']:<3} {i['title']}  {when}" + (col(f"\n       {i['pitch']}", "dim") if i["pitch"] else ""))
+    gone = [i for i in db["ideas"] if i["status"] == "dropped"]
+    if gone:
+        print(col(f"\n  {plural(len(gone), 'idea')} let go so far.", "dim"))
+    if "--all" in args:
+        for i in db["ideas"]:
+            if i["status"] != "waiting":
+                print(col(f"  #{i['id']:<3} {i['title']}  [{i['status']} {i.get('closed', '')}]", "dim"))
 
 
 def cmd_roadmap(db, args):
@@ -800,7 +921,33 @@ def board(refresh=False):
                     "repoUrl": (entry["data"].get("url") if entry else None),
                     "fetchedAt": entry["at"] if entry else None})
     weeks = [(date.today() - timedelta(days=7 * (WEEKS - 1 - i))).isoformat() for i in range(WEEKS)]
-    return {"today": today(), "focusLimit": db["focus_limit"], "weeks": weeks, "projects": out}
+    ideas = {"cooldown": db["idea_cooldown_days"],
+             "waiting": [idea_view(db, i) for i in db["ideas"] if i["status"] == "waiting"],
+             "letGo": sum(i["status"] == "dropped" for i in db["ideas"]),
+             "started": sum(i["status"] == "started" for i in db["ideas"])}
+    return {"today": today(), "focusLimit": db["focus_limit"], "weeks": weeks, "projects": out, "ideas": ideas}
+
+
+def idea_action(iid, body):
+    db = load()
+    try:
+        if iid is None:
+            idea = add_idea(db, str(body.get("title", "")), str(body.get("pitch", "")))
+            result = {"ok": True, "id": idea["id"]}
+        elif body.get("action") == "start":
+            name, path, created = start_idea(db, iid, body.get("path"))
+            result = {"ok": True, "project": name, "created": created}
+        elif body.get("action") == "drop":
+            drop_idea(db, iid, str(body.get("note", "")))
+            result = {"ok": True}
+        else:
+            return 400, {"error": "unknown action"}
+    except ValueError as e:
+        return 409, {"error": str(e)}
+    except OSError as e:
+        return 500, {"error": f"Couldn't create the project folder: {e.strerror}"}
+    save(db)
+    return 200, result
 
 
 EDITABLE = ("next", "why", "blocker", "leftoff")
@@ -879,17 +1026,21 @@ def cmd_serve(db, args):
         def do_POST(self):
             if not self.trusted() or self.headers.get("Content-Type") != "application/json":
                 return self.send(403, {"error": "forbidden"})
-            m = re.fullmatch(r"/api/projects/([^/]+)(/task)?", urlparse(self.path).path)
-            if not m:
+            path = urlparse(self.path).path
+            m = re.fullmatch(r"/api/projects/([^/]+)(/task)?", path)
+            idea = re.fullmatch(r"/api/ideas(?:/(\d+))?", path)
+            if not m and not idea:
                 return self.send(404, {"error": "not found"})
             try:
                 body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
-                if m[2]:
+                if m and m[2]:
                     task = (int(body["line"]), str(body["text"]), bool(body["done"]))
-            except (ValueError, KeyError, TypeError):
+            except (ValueError, KeyError, TypeError, AttributeError):
                 return self.send(400, {"error": "bad request"})
             with write_lock:
-                if m[2]:
+                if idea:
+                    self.send(*idea_action(idea[1], body))
+                elif m[2]:
                     self.send(*toggle_task(unquote(m[1]), *task))
                 else:
                     self.send(*update_project(unquote(m[1]), body))
@@ -910,6 +1061,10 @@ HELP = """pm — keep your projects from quietly dying
   pm                      the board: focus, in motion, stalled
   pm serve [port]         the web board (default http://localhost:4242)
   pm review               triage stalled projects one by one (do this weekly)
+  pm idea "..." ["why"]   park a new project idea; it can start after a 7-day cooldown
+  pm ideas [--all]        the idea inbox
+  pm idea start <id> [path]  ready idea → new repo + ROADMAP.md, in focus (needs a free slot)
+  pm idea drop <id> [note]   let an idea go
   pm focus <name>         put a project in focus (max 3)
   pm unfocus <name>
   pm next <name> "..."    the very next concrete step — makes resuming easy
@@ -935,6 +1090,7 @@ COMMANDS = {
     "next": cmd_text("next", "next"), "why": cmd_text("why", "why"), "note": cmd_note,
     "block": cmd_text("blocker", "blocker"), "unblock": cmd_unblock, "serve": cmd_serve,
     "roadmap": cmd_roadmap, "leftoff": cmd_text("leftoff", "left off"),
+    "idea": cmd_idea, "ideas": cmd_ideas,
     "park": set_status("parked", "park"), "drop": set_status("dropped", "drop"),
     "done": set_status("done", "done"), "revive": set_status("active", "revive"),
     "show": cmd_show, "list": cmd_list, "add": cmd_add, "root": cmd_root, "ignore": cmd_ignore,

@@ -8,6 +8,7 @@ const css = (name) => `var(--${name})`;
 const state = {
   data: null, filter: '', open: null, tab: 'all', editing: null, expanded: null,
   collapsed: { parked: true, archived: true }, suggest: false, skipped: [],
+  startingIdea: null, droppingIdea: null, refocusIdea: false,
 };
 
 // ---------- data ----------
@@ -29,16 +30,19 @@ async function load(refresh = false) {
   }
 }
 
-async function post(path, body) {
+// POST JSON; returns the response body, or null after showing the error.
+async function postJson(path, body) {
   try {
     const res = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
     const data = await res.json();
-    if (!res.ok) return toast(data.error || 'Save failed', true), false;
-    return true;
+    if (!res.ok) return toast(data.error || 'Save failed', true), null;
+    return data;
   } catch {
-    return toast('Save failed: pm serve is not reachable', true), false;
+    return toast('Save failed: pm serve is not reachable', true), null;
   }
 }
+
+const post = async (path, body) => !!(await postJson(path, body));
 
 async function update(name, changes, okMsg) {
   const ok = await post('/api/projects/' + encodeURIComponent(name), changes);
@@ -174,7 +178,7 @@ function tiles(projects) {
   const w = (n) => `${(100 * n) / active}%`;
 
   const almost = ds
-    .filter(([p, d]) => p.status === 'active' && d.ms.left > 0 && d.ms.left <= 3 && d.ms.title)
+    .filter(([p, d]) => p.status === 'active' && d.ms.left > 0 && d.ms.left <= 3 && d.ms.pct >= 50 && d.ms.title)
     .sort((a, b) => a[1].ms.left - b[1].ms.left || b[1].ms.pct - a[1].ms.pct)
     .slice(0, 3);
 
@@ -288,6 +292,57 @@ function suggestCard({ p, reason }) {
       <button class="plain chip-btn ghost" data-skip="${esc(p.name)}">Skip</button>
     </div>
   </div>`;
+}
+
+// ---------- idea inbox ----------
+
+function ideasBlock(projects) {
+  const { waiting, cooldown, letGo, started } = state.data.ideas;
+  const focusFull = projects.filter((p) => p.status === 'active' && p.focus).length >= state.data.focusLimit;
+  const ideas = waiting.slice().sort((a, b) => a.daysLeft - b.daysLeft || a.id - b.id);
+  const ready = ideas.filter((i) => i.ready).length;
+
+  const cards = ideas.map((i) => {
+    const pct = Math.min(100, Math.round((100 * i.age) / cooldown));
+    let foot;
+    if (state.startingIdea === i.id) {
+      foot = `<div class="idea-confirm">
+        <label class="ex-k" for="idea-path-${i.id}">Create the project at</label>
+        <input id="idea-path-${i.id}" class="next-input" data-idea-path value="${esc(i.defaultPath)}">
+        <div class="sugg-actions"><button class="plain chip-btn blue" data-idea-go="${i.id}">Create &amp; focus</button><button class="plain chip-btn ghost" data-idea-cancel>Cancel</button></div>
+      </div>`;
+    } else {
+      const start = i.ready
+        ? `<button class="plain chip-btn ${focusFull ? 'muted' : 'blue'}" data-idea-start="${i.id}" ${focusFull ? 'data-full data-tip="Focus is full. Free a slot first"' : ''}>Start it</button>` : '';
+      const drop = state.droppingIdea === i.id
+        ? `<button class="plain chip-btn kill" data-idea-drop="${i.id}" data-confirmed>Let it go?</button>`
+        : `<button class="plain chip-btn ghost" data-idea-drop="${i.id}">Let it go</button>`;
+      foot = `<div class="idea-foot"><span class="ex-k">Parked ${ago(i.age)}</span><div class="sugg-actions">${start}${drop}</div></div>`;
+    }
+    return `<div class="idea${i.ready ? ' ready' : ''}">
+      <div class="slot-top">
+        <span class="name">${esc(i.title)}</span>
+        <span class="idea-when">${i.ready ? `<span class="dot" style="background:${css('green')}"></span>Ready` : `<span class="mono">${i.daysLeft}d</span> to go`}</span>
+      </div>
+      ${i.pitch ? `<div class="sugg-reason">${esc(i.pitch)}</div>` : ''}
+      ${meter(pct, i.ready ? 'Cooldown done' : `Cooldown ${i.age} of ${cooldown} days`)}
+      ${foot}
+    </div>`;
+  });
+
+  return `<section class="block" id="ideas">
+    <div class="block-head">
+      <h2>Idea inbox<span>${ideas.length}${ready ? ` · ${ready} ready` : ''}</span></h2>
+      <span class="hint">New ideas wait ${cooldown} days before they can become a project${started ? ` · ${started} started so far` : ''}</span>
+    </div>
+    <form class="idea-add" data-idea-form>
+      <input name="title" placeholder="New project idea? Park it here instead of starting it" aria-label="Idea" autocomplete="off" required>
+      <input name="pitch" placeholder="Why it's exciting (optional)" aria-label="Why it's exciting" autocomplete="off">
+      <button class="btn">Park idea</button>
+    </form>
+    ${cards.length ? `<div class="idea-grid">${cards.join('')}</div>` : ''}
+    ${letGo ? `<p class="idea-note">${plural(letGo, 'idea')} let go so far: ${letGo === 1 ? 'a project' : `${letGo} projects`} you never had to abandon.</p>` : ''}
+  </section>`;
 }
 
 // ---------- table ----------
@@ -418,8 +473,13 @@ function render() {
   const mins = isFinite(fetched) ? Math.round((Date.now() / 1000 - fetched) / 60) : null;
   $('#sub').textContent = `${all.length} tracked` + (mins != null ? ` · GitHub synced ${mins < 1 ? 'just now' : `${mins} min ago`}` : '');
 
-  $('#app').innerHTML = tiles(all) + focusBlock(all) + table(all);
+  $('#app').innerHTML = tiles(all) + focusBlock(all) + ideasBlock(all) + table(all);
 
+  if (state.refocusIdea) {
+    state.refocusIdea = false;
+    $('[data-idea-form] [name="title"]').focus();
+  }
+  if (state.startingIdea) $('[data-idea-path]')?.focus();
   if (state.editing) {
     const input = $(`[data-edit="${CSS.escape(state.editing)}"]`);
     if (input) {
@@ -601,7 +661,55 @@ async function acceptAll() {
   toast(`★ ${names.join(', ')} ${names.length === 1 ? 'is' : 'are'} in focus`);
 }
 
+async function startIdea(id, path) {
+  const res = await postJson(`/api/ideas/${id}`, { action: 'start', path });
+  if (!res) return;
+  state.startingIdea = null;
+  await load();
+  toast(`★ ${res.project} ${res.created ? 'created' : 'linked'} and in focus. Go!`);
+}
+
+async function dropIdea(id) {
+  if (!(await post(`/api/ideas/${id}`, { action: 'drop' }))) return;
+  await load();
+  toast("Let go. That's a project you'll never have to abandon.");
+}
+
+$('#app').addEventListener('submit', async (e) => {
+  const form = e.target.closest('[data-idea-form]');
+  if (!form) return;
+  e.preventDefault();
+  const title = form.title.value.trim();
+  if (!title) return;
+  if (!(await post('/api/ideas', { title, pitch: form.pitch.value }))) return;
+  state.refocusIdea = true;
+  await load();
+  const ready = new Date();
+  ready.setDate(ready.getDate() + state.data.ideas.cooldown);
+  toast(`Parked. If you still want it on ${ready.toLocaleDateString(undefined, { weekday: 'long', month: 'short', day: 'numeric' })}, it's yours.`);
+});
+
 $('#app').addEventListener('click', (e) => {
+  const ideaBtn = e.target.closest('[data-idea-start],[data-idea-go],[data-idea-cancel],[data-idea-drop]');
+  if (ideaBtn) {
+    const ds = ideaBtn.dataset;
+    if (ds.ideaStart) {
+      if ('full' in ds) return toast(`Focus is full (${state.data.focusLimit}). Finish, park or unstar a project first.`, true);
+      state.startingIdea = Number(ds.ideaStart);
+      state.droppingIdea = null;
+    } else if (ds.ideaGo) {
+      return startIdea(ds.ideaGo, $('[data-idea-path]').value);
+    } else if ('ideaCancel' in ds) {
+      state.startingIdea = null;
+    } else if (ds.ideaDrop) {
+      if ('confirmed' in ds) {
+        state.droppingIdea = null;
+        return dropIdea(ds.ideaDrop);
+      }
+      state.droppingIdea = Number(ds.ideaDrop);
+    }
+    return render();
+  }
   if (e.target.closest('a')) return;
   const el = e.target.closest('[data-act],[data-star],[data-focus-it],[data-skip],[data-revive],[data-status],[data-editbtn],[data-expand],[data-tab],[data-group],[data-jump],[data-name]');
   if (!el) return;

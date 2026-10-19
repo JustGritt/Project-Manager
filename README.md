@@ -31,6 +31,16 @@ pm serve          # http://localhost:4242
 
 The server only listens on `127.0.0.1` and rejects requests from other origins.
 
+## Idea inbox
+
+New project ideas go into the inbox instead of becoming projects right away:
+
+- An idea waits **7 days** before it can start (`idea_cooldown_days` in `projects.json`).
+- Starting one needs a **free focus slot**. It creates the folder (default: `~/orca/projects/<Title>`), runs `git init`, writes a starter `ROADMAP.md` and puts the project in focus.
+- Letting an idea go is counted as a win: it's a project you never had to abandon.
+
+From the board use the inbox section; from the terminal use `pm idea "..."`, `pm ideas`, `pm idea start <id>` and `pm idea drop <id>`.
+
 ## Where progress comes from
 
 1. **GitHub issues and milestones**, if the repo has issues. Each milestone's progress is closed / total issues, and the current milestone is the first unfinished one. Labels containing `block` mark blockers; `decision` or `question` mark decisions waiting on you; `in-progress` floats issues to the top.
@@ -53,6 +63,9 @@ The server only listens on `127.0.0.1` and rejects requests from other origins.
 pm                      the board: focus, in motion, stalled
 pm serve [port]         the web board
 pm review               triage stalled projects one by one (do this weekly)
+pm idea "..." ["why"]   park a new project idea
+pm ideas [--all]        the idea inbox
+pm idea start|drop <id>
 pm focus|unfocus <name>
 pm next <name> "..."    the very next concrete step
 pm leftoff <name> "..." where you left off
