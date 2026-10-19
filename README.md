@@ -51,7 +51,18 @@ pm autostart status
 pm autostart off
 ```
 
-Uses each system's own login mechanism, no admin rights needed: a LaunchAgent on macOS (log in `~/Library/Logs/pm-board.log`), a systemd user service on Linux (or a desktop autostart entry where systemd isn't available), and a hidden launcher in the Startup folder on Windows.
+`pm start` / `pm stop` run the board in the background (or stop it) without touching the login item.
+
+### Menu bar / tray light
+
+```sh
+pm tray on            # builds the app with cargo on first run
+pm tray off
+```
+
+A small native Rust app (`tray/`, no webview: about 13 MB of memory, idle CPU) that shows a filled green dot while the board is running and a hollow ring when it isn't. Its menu lists this week's focus with next steps, ideas that are ready to start, and Open / Start / Stop board and "Start board at login". Needs [Rust](https://rustup.rs) to build; on Linux also `libgtk-3-dev libayatana-appindicator3-dev`.
+
+Autostart uses each system's own login mechanism, no admin rights needed: a LaunchAgent on macOS (log in `~/Library/Logs/pm-board.log`), a systemd user service on Linux (or a desktop autostart entry where systemd isn't available), and a hidden launcher in the Startup folder on Windows.
 
 ## Idea inbox
 

@@ -4,10 +4,12 @@
 Activity is read from git automatically; you only record intent:
 what's in focus, why it matters, and the very next step.
 """
+import functools
 import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -1040,6 +1042,8 @@ def cmd_serve(db, args):
             if not self.trusted():
                 return self.send(403, {"error": "forbidden"})
             url = urlparse(self.path)
+            if url.path == "/api/status":
+                return self.send(200, quick_status(port))
             if url.path == "/api/board":
                 return self.send(200, board(refresh="refresh" in parse_qs(url.query)))
             name = "index.html" if url.path == "/" else os.path.basename(url.path)
@@ -1077,12 +1081,77 @@ def cmd_serve(db, args):
     except OSError:
         sys.exit(f"Port {port} is already in use. If pm is already running, open {url}")
     print(f"{datetime.now():%Y-%m-%d %H:%M}  pm board at {col(url, 'c')}  (Ctrl+C to stop)")
+    os.makedirs(os.path.dirname(PIDFILE), exist_ok=True)
+    with open(PIDFILE, "w", encoding="utf-8") as f:
+        f.write(f"{os.getpid()} {port}\n")
+    # `pm stop` sends SIGTERM; exit through the finally block so the pidfile is cleaned up.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     if "--no-open" not in args:
         webbrowser.open(url)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print()
+    finally:
+        server.server_close()
+        if read_pidfile() == (os.getpid(), port):
+            os.remove(PIDFILE)
+
+
+PIDFILE = os.path.join(HERE, ".cache", "pm-board.pid")
+
+
+def read_pidfile():
+    try:
+        with open(PIDFILE, encoding="utf-8") as f:
+            pid, port = f.read().split()
+        return int(pid), int(port)
+    except (OSError, ValueError):
+        return None
+
+
+def quick_status(port):
+    """What the menu bar needs, without scanning any repos."""
+    db = load()
+    focus = [{"name": n, "next": p.get("next", "")} for n, p in db["projects"].items()
+             if p.get("focus") and p.get("status") == "active"]
+    ready = sum(idea_view(db, i)["ready"] for i in db["ideas"] if i["status"] == "waiting")
+    return {"ok": True, "port": port, "focus": focus, "focusLimit": db["focus_limit"], "ideasReady": ready,
+            "autostart": os.path.exists(autostart_target()[1])}
+
+
+def cmd_start(db, args):
+    port = next((int(a) for a in args if a.isdigit()), autostart_port(autostart_target()[1]))
+    url = f"http://localhost:{port}"
+    if board_running(port):
+        return print(f"The board is already running at {url}")
+    os.makedirs(os.path.dirname(log_path()), exist_ok=True)
+    spawn([pythonw(), SCRIPT, "serve", str(port), "--no-open", "--log", log_path()])
+    for _ in range(30):
+        if board_running(port):
+            return print(col(f"✓ Board running at {url}", "g"))
+        time.sleep(0.2)
+    sys.exit(f"The board didn't start; see {tilde(log_path())}")
+
+
+def cmd_stop(db, args):
+    info = read_pidfile()
+    if not info or not board_running(info[1]):
+        port = DEFAULT_PORT if not info else info[1]
+        if board_running(port):
+            sys.exit(f"A board is running on port {port}, but not one pm started in the background "
+                     "(probably a terminal). Stop it there with Ctrl+C.")
+        return print("The board isn't running.")
+    pid, port = info
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError as e:
+        sys.exit(f"Couldn't stop the board (pid {pid}): {e.strerror}")
+    for _ in range(30):
+        if not board_running(port):
+            return print("Board stopped.")
+        time.sleep(0.2)
+    sys.exit(f"The board (pid {pid}) is still running.")
 
 
 # ---------- autostart ----------
@@ -1093,6 +1162,7 @@ AUTOSTART_ID = "dev.pm.board"
 SCRIPT = os.path.realpath(__file__)
 
 
+@functools.lru_cache(maxsize=None)  # the systemd probe runs a subprocess
 def autostart_target():
     """Where the login item lives on this OS: (kind, path)."""
     home = os.path.expanduser("~")
@@ -1122,58 +1192,95 @@ def board_running(port):
         return s.connect_ex(("127.0.0.1", port)) == 0
 
 
+DETACH = {"creationflags": 0x08000000} if os.name == "nt" else {"start_new_session": True}  # CREATE_NO_WINDOW
+
+
+def spawn(argv):
+    subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **DETACH)
+
+
+def pythonw():
+    """On Windows, the console-less interpreter; elsewhere the current one."""
+    pyw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+    return pyw if os.name == "nt" and os.path.exists(pyw) else sys.executable
+
+
+# Login-item writers shared by the board and the menu bar app.
+
+def launch_agent(label, argv, log):
+    """macOS: install and start a LaunchAgent."""
+    import plistlib
+    path = os.path.join(os.path.expanduser("~"), "Library", "LaunchAgents", f"{label}.plist")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        plistlib.dump({
+            "Label": label, "ProgramArguments": argv, "RunAtLoad": True,
+            # Login items get a bare PATH; keep ours so git and gh are found.
+            "EnvironmentVariables": {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "PYTHONUNBUFFERED": "1"},
+            "StandardOutPath": log, "StandardErrorPath": log,
+        }, f)
+    domain = f"gui/{os.getuid()}"
+    subprocess.run(["launchctl", "bootout", f"{domain}/{label}"], capture_output=True)
+    subprocess.run(["launchctl", "bootstrap", domain, path], capture_output=True)
+    return path
+
+
+def launch_agent_remove(label):
+    subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{label}"], capture_output=True)
+
+
+def startup_vbs(path, argv):
+    """Windows: a launcher in the Startup folder that runs argv with no window."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    cmd = " ".join(f'""{a}""' for a in argv)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(f'CreateObject("WScript.Shell").Run "{cmd}", 0, False\n')
+    return path
+
+
+def xdg_entry(path, name, argv):
+    """Linux desktops: an autostart entry run when the graphical session starts."""
+    import shlex
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(f"[Desktop Entry]\nType=Application\nName={name}\nNoDisplay=true\n"
+                f"Exec={shlex.join(argv)}\nX-GNOME-Autostart-enabled=true\n")
+    return path
+
+
 def autostart_on(port):
     kind, path = autostart_target()
-    os.makedirs(os.path.dirname(path), exist_ok=True)
     os.makedirs(os.path.dirname(log_path()), exist_ok=True)
-    py, log = sys.executable, log_path()
+    log = log_path()
     serve = [SCRIPT, "serve", str(port), "--no-open"]
 
     if kind == "launchd":
-        import plistlib
-        with open(path, "wb") as f:
-            plistlib.dump({
-                "Label": AUTOSTART_ID, "ProgramArguments": [py, *serve], "RunAtLoad": True,
-                # Login items get a bare PATH; keep ours so git and gh are found.
-                "EnvironmentVariables": {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "PYTHONUNBUFFERED": "1"},
-                "StandardOutPath": log, "StandardErrorPath": log,
-            }, f)
-        domain = f"gui/{os.getuid()}"
-        subprocess.run(["launchctl", "bootout", f"{domain}/{AUTOSTART_ID}"], capture_output=True)
-        subprocess.run(["launchctl", "bootstrap", domain, path], capture_output=True)
+        launch_agent(AUTOSTART_ID, [sys.executable, *serve], log)
     elif kind == "systemd":
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         quote = lambda s: '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
         with open(path, "w", encoding="utf-8") as f:
             f.write("[Unit]\nDescription=pm project board\n\n[Service]\n"
-                    f"ExecStart={' '.join(quote(a) for a in [py, *serve])}\n"
+                    f"ExecStart={' '.join(quote(a) for a in [sys.executable, *serve])}\n"
                     f"Environment={quote('PATH=' + os.environ.get('PATH', '/usr/bin:/bin'))} PYTHONUNBUFFERED=1\n"
                     "Restart=on-failure\nRestartSec=30\n\n[Install]\nWantedBy=default.target\n")
         subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
         subprocess.run(["systemctl", "--user", "enable", "--now", "pm-board.service"], capture_output=True)
-    elif kind == "xdg":
-        import shlex
-        with open(path, "w", encoding="utf-8") as f:
-            f.write("[Desktop Entry]\nType=Application\nName=pm board\nNoDisplay=true\n"
-                    f"Exec={shlex.join([py, *serve, '--log', log])}\nX-GNOME-Autostart-enabled=true\n")
+    else:
+        argv = [pythonw(), *serve, "--log", log]
+        if kind == "xdg":
+            xdg_entry(path, "pm board", argv)
+        else:
+            startup_vbs(path, argv)
         if not board_running(port):
-            subprocess.Popen([py, *serve, "--log", log], start_new_session=True,
-                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    else:  # Windows: a hidden launcher in the Startup folder, running pythonw (no console window)
-        pyw = os.path.join(os.path.dirname(py), "pythonw.exe")
-        pyw = pyw if os.path.exists(pyw) else py
-        cmd = " ".join(f'""{a}""' for a in [pyw, *serve, "--log", log])
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(f'CreateObject("WScript.Shell").Run "{cmd}", 0, False\n')
-        if not board_running(port):
-            subprocess.Popen([pyw, *serve, "--log", log], creationflags=0x08000000,  # CREATE_NO_WINDOW
-                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            spawn(argv)
     return kind, path
 
 
 def autostart_off():
     kind, path = autostart_target()
     if kind == "launchd":
-        subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{AUTOSTART_ID}"], capture_output=True)
+        launch_agent_remove(AUTOSTART_ID)
     elif kind == "systemd":
         subprocess.run(["systemctl", "--user", "disable", "--now", "pm-board.service"], capture_output=True)
     existed = os.path.exists(path)
@@ -1182,6 +1289,104 @@ def autostart_off():
     if kind == "systemd":
         subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
     return kind, path, existed
+
+
+# ---------- menu bar / tray app ----------
+# A small Rust app (tray/) that shows whether the board is running.
+
+TRAY_ID = "dev.pm.tray"
+TRAY_DIR = os.path.join(HERE, "tray")
+TRAY_PID = os.path.join(HERE, ".cache", "pm-tray.pid")
+
+
+def tray_binary():
+    return os.path.join(TRAY_DIR, "target", "release", "pm-tray" + (".exe" if os.name == "nt" else ""))
+
+
+def tray_login_item():
+    if sys.platform == "darwin":
+        return os.path.join(os.path.expanduser("~"), "Library", "LaunchAgents", f"{TRAY_ID}.plist")
+    if os.name == "nt":
+        return os.path.join(os.path.dirname(autostart_target()[1]), "pm-tray.vbs")
+    config = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(config, "autostart", "pm-tray.desktop")
+
+
+def build_tray():
+    """Build the tray app if it's missing or older than its source."""
+    binary = tray_binary()
+    sources = [os.path.join(TRAY_DIR, "Cargo.toml"), os.path.join(TRAY_DIR, "src", "main.rs")]
+    if os.path.exists(binary) and os.path.getmtime(binary) >= max(map(os.path.getmtime, sources)):
+        return binary
+    if not shutil.which("cargo"):
+        raise RuntimeError("Building the menu app needs Rust. Install it from https://rustup.rs and run this again.")
+    print(col("Building the menu app (first time takes a minute)…", "dim"), flush=True)
+    r = subprocess.run(["cargo", "build", "--release", "--manifest-path", sources[0]],
+                       capture_output=True, encoding="utf-8", errors="replace")
+    if r.returncode != 0:
+        hint = ("\nOn Linux it needs GTK and AppIndicator: sudo apt install libgtk-3-dev libayatana-appindicator3-dev"
+                if sys.platform.startswith("linux") else "")
+        raise RuntimeError("cargo build failed:\n" + r.stderr.strip()[-1500:] + hint)
+    return binary
+
+
+def tray_pid():
+    try:
+        with open(TRAY_PID, encoding="utf-8") as f:
+            pid = int(f.read().strip())
+        os.kill(pid, 0)  # still alive?
+        return pid
+    except (OSError, ValueError):
+        return None
+
+
+def tray_stop():
+    if sys.platform == "darwin":
+        launch_agent_remove(TRAY_ID)
+    pid = tray_pid()
+    if pid:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    if os.path.exists(TRAY_PID):
+        os.remove(TRAY_PID)
+
+
+def cmd_tray(db, args):
+    action = args[0] if args else "status"
+    if action == "on":
+        try:
+            binary = build_tray()
+        except RuntimeError as e:
+            sys.exit(col(str(e), "r"))
+        tray_stop()
+        port = autostart_port(autostart_target()[1])
+        os.makedirs(os.path.dirname(TRAY_PID), exist_ok=True)
+        argv = [binary, "--python", sys.executable, "--script", SCRIPT, "--port", str(port), "--pidfile", TRAY_PID]
+        if sys.platform == "darwin":
+            launch_agent(TRAY_ID, argv, os.path.join(os.path.dirname(log_path()), "pm-tray.log"))
+        else:
+            (startup_vbs(tray_login_item(), argv) if os.name == "nt"
+             else xdg_entry(tray_login_item(), "pm menu", argv))
+            spawn(argv)
+        where = "menu bar" if sys.platform == "darwin" else "system tray"
+        print(col(f"✓ pm is in your {where}", "g") + " and will be there after every login.")
+        print(col("  Filled green dot: board running · hollow ring: not running.", "dim"))
+    elif action == "off":
+        tray_stop()
+        item = tray_login_item()
+        if os.path.exists(item):
+            os.remove(item)
+        print("The pm menu is gone and won't start at login.")
+    elif action == "status":
+        on = os.path.exists(tray_login_item())
+        print(f"Menu app: {col('on', 'g') if on else col('off', 'dim')}"
+              + (f"  ({'running' if tray_pid() else 'not running'}, {tilde(tray_login_item())})" if on else ""))
+        if not on:
+            print(col("Turn it on with: pm tray on", "dim"))
+    else:
+        sys.exit("usage: pm tray [on | off | status]")
 
 
 def autostart_port(path):
@@ -1234,6 +1439,8 @@ HELP = """pm — keep your projects from quietly dying
   pm                      the board: focus, in motion, stalled
   pm serve [port]         the web board (default http://localhost:4242)
   pm autostart [on|off]   start the web board at login (macOS, Linux, Windows)
+  pm start | pm stop      run the web board in the background, or stop it
+  pm tray [on|off]        a menu bar / tray light showing whether the board is running
   pm review               triage stalled projects one by one (do this weekly)
   pm idea "..." ["why"]   park a new project idea; it can start after a 7-day cooldown
   pm ideas [--all]        the idea inbox
@@ -1265,6 +1472,7 @@ COMMANDS = {
     "block": cmd_text("blocker", "blocker"), "unblock": cmd_unblock, "serve": cmd_serve,
     "roadmap": cmd_roadmap, "leftoff": cmd_text("leftoff", "left off"),
     "idea": cmd_idea, "ideas": cmd_ideas, "autostart": cmd_autostart,
+    "start": cmd_start, "stop": cmd_stop, "tray": cmd_tray,
     "park": set_status("parked", "park"), "drop": set_status("dropped", "drop"),
     "done": set_status("done", "done"), "revive": set_status("active", "revive"),
     "show": cmd_show, "list": cmd_list, "add": cmd_add, "root": cmd_root, "ignore": cmd_ignore,
