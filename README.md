@@ -6,28 +6,129 @@ A project manager for people who start a lot of projects and finish few of them.
 
 No dependencies: Python 3.8+ standard library, `git` 2.21+, and optionally the [GitHub CLI](https://cli.github.com/) (`gh`) for issues. Works on macOS, Linux and Windows.
 
-## Setup
+## Installation
 
-macOS / Linux:
+| | Needed for | macOS | Windows |
+|---|---|---|---|
+| Python 3.8+ | everything | comes with Xcode Command Line Tools | `winget install Python.Python.3.13` |
+| Git 2.21+ | everything | comes with Xcode Command Line Tools | `winget install Git.Git` |
+| GitHub CLI | progress from GitHub issues (optional) | `brew install gh` | `winget install GitHub.cli` |
+| Rust | the menu bar / tray light (optional) | [rustup.rs](https://rustup.rs) | `winget install Rustlang.Rustup` |
+
+### macOS
+
+1. **Install the tools** (skip any you already have):
+
+   ```sh
+   xcode-select --install                                          # git and python3
+   brew install gh                                                 # optional: GitHub issues
+   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh  # optional: menu bar light
+   ```
+
+2. **Get the code.** The repo is private, so sign in to GitHub first:
+
+   ```sh
+   gh auth login
+   gh repo clone JustGritt/Project-Manager ~/orca/projects/Project-Manager
+   ```
+
+3. **Put `pm` on your PATH:**
+
+   ```sh
+   mkdir -p ~/.local/bin
+   ln -s ~/orca/projects/Project-Manager/pm ~/.local/bin/pm
+   echo $PATH | tr ':' '\n' | grep -qx "$HOME/.local/bin" || echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
+   ```
+
+   Open a new terminal (or run `rehash`) so the shell picks up the new command.
+
+4. **First run.** This discovers your projects and opens the board:
+
+   ```sh
+   pm
+   pm serve
+   ```
+
+5. **Keep it running** (optional). Start the board at login and add the menu bar light:
+
+   ```sh
+   pm autostart on       # board at http://localhost:4242 after every login
+   pm tray on            # ● pm in the menu bar; the first build takes a minute
+   ```
+
+### Windows
+
+Use **PowerShell** (Windows Terminal is the nicest). If `python` opens the Microsoft Store instead of running, turn off the `python.exe` alias in *Settings → Apps → Advanced app settings → App execution aliases*.
+
+1. **Install the tools** (skip any you already have), then open a new PowerShell window:
+
+   ```powershell
+   winget install Python.Python.3.13
+   winget install Git.Git
+   winget install GitHub.cli          # optional: GitHub issues
+   winget install Rustlang.Rustup     # optional: tray light
+   ```
+
+   Rust on Windows also needs the Visual Studio C++ Build Tools. Running `rustup-init` offers to install them; accept the default.
+
+2. **Get the code.** The repo is private, so sign in to GitHub first:
+
+   ```powershell
+   gh auth login
+   gh repo clone JustGritt/Project-Manager "$HOME\Projects\Project-Manager"
+   ```
+
+3. **Put `pm` on your PATH** so you can type `pm` instead of `python pm`. `pm.cmd` does the rest:
+
+   ```powershell
+   $pm = "$HOME\Projects\Project-Manager"
+   [Environment]::SetEnvironmentVariable("Path", [Environment]::GetEnvironmentVariable("Path", "User") + ";$pm", "User")
+   ```
+
+   Open a new PowerShell window afterwards.
+
+4. **First run.** `pm` only looks in `~`, `~/orca` and `~/orca/projects` by default, so tell it where your projects live:
+
+   ```powershell
+   pm root "$HOME\Projects"
+   pm
+   pm serve
+   ```
+
+5. **Keep it running** (optional). Start the board at login and add the tray light:
+
+   ```powershell
+   pm autostart on       # board at http://localhost:4242 after every sign-in
+   pm tray on            # dot in the taskbar tray; the first build takes a few minutes
+   ```
+
+   New tray icons often start hidden under the **^** arrow. Drag the dot onto the taskbar to keep it visible.
+
+### Linux
+
+Same as macOS, with your package manager instead of Homebrew. The tray light also needs `libgtk-3-dev libayatana-appindicator3-dev` (Debian/Ubuntu names) to build.
+
+### Finding projects
+
+`pm` treats any folder containing `.git`, `project.godot`, `ProjectSettings`, `package.json`, `Cargo.toml` or `pyproject.toml` as a project. It searches the immediate subfolders of `~`, `~/orca` and `~/orca/projects`; add more places with `pm root <dir>`, a single folder with `pm add <path>`, and hide one with `pm ignore <name>`.
+
+### Updating
 
 ```sh
-git clone git@github.com:JustGritt/Project-Manager.git
-ln -s "$PWD/Project-Manager/pm" ~/.local/bin/pm   # any directory on your PATH
-gh auth login                                     # optional, for GitHub issues
-pm                                                # first run discovers your projects
+cd ~/orca/projects/Project-Manager     # Windows: cd $HOME\Projects\Project-Manager
+git pull
+pm stop; pm start                      # reload the board
+pm tray on                             # rebuilds the tray light if its code changed
 ```
 
-Windows (PowerShell, with Python and Git for Windows installed):
+### Uninstalling
 
-```powershell
-git clone git@github.com:JustGritt/Project-Manager.git
-# Add the Project-Manager folder to your PATH (or copy pm.cmd somewhere on it), then:
-pm
+```sh
+pm tray off
+pm autostart off
 ```
 
-`pm.cmd` runs `python pm` for you; `python pm <command>` works too.
-
-Projects are discovered in `~`, `~/orca` and `~/orca/projects` by default (any folder with `.git`, `project.godot`, `ProjectSettings`, `package.json`, `Cargo.toml` or `pyproject.toml`). Add more with `pm root <dir>`.
+Then delete the `Project-Manager` folder, plus the `~/.local/bin/pm` link on macOS or the PATH entry on Windows. Your data is in `projects.json` inside that folder, so copy it first if you want to keep your notes.
 
 ## Web board
 
@@ -95,6 +196,9 @@ From the board use the inbox section; from the terminal use `pm idea "..."`, `pm
 ```
 pm                      the board: focus, in motion, stalled
 pm serve [port]         the web board
+pm start | pm stop      run the web board in the background, or stop it
+pm autostart [on|off]   start the web board at login
+pm tray [on|off]        the menu bar / tray light
 pm review               triage stalled projects one by one (do this weekly)
 pm idea "..." ["why"]   park a new project idea
 pm ideas [--all]        the idea inbox
