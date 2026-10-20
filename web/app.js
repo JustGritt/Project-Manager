@@ -5,8 +5,11 @@ const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '
 const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
 const css = (name) => `var(--${name})`;
 
+// Browser storage can be missing or blocked; the view choice is only a convenience.
+const stored = (key) => { try { return localStorage.getItem(key); } catch { return null; } };
+
 const state = {
-  data: null, filter: '', open: null, tab: 'all', editing: null, expanded: null,
+  data: null, filter: '', open: null, tab: 'all', view: stored('pm-view') || 'board', editing: null, expanded: null,
   collapsed: { parked: true, archived: true }, suggest: false, skipped: [],
   startingIdea: null, droppingIdea: null, refocusIdea: false,
 };
@@ -452,7 +455,8 @@ function table(projects) {
     ? ['motion', 'stalled', 'done', 'parked', 'archived'].filter((k) => k === 'motion' || k === 'stalled' || lists[k].length)
     : [state.tab];
 
-  return `<section class="block" id="projects">
+  if (state.view === 'board') return projectsBlock(kanban(projects, match));
+  return projectsBlock(`
     <div class="tabs" role="tablist">${tabs.map(([k, label, n]) => `
       <button class="plain tab${state.tab === k ? ' on' : ''}" role="tab" aria-selected="${state.tab === k}" data-tab="${k}">${label}<span>${n}</span></button>`).join('')}
     </div>
@@ -474,8 +478,99 @@ function table(projects) {
           </div>`;
         }).join('')}
       </div>
+    </div>`);
+}
+
+function projectsBlock(body) {
+  const views = [['board', 'Board'], ['list', 'List']];
+  return `<section class="block" id="projects">
+    <div class="block-head">
+      <h2>All projects<span>${state.data.projects.length}</span></h2>
+      <div class="block-tools">
+        ${state.view === 'board' ? '<span class="hint">Drag a card to change its status</span>' : ''}
+        <div class="seg" role="group" aria-label="View">${views.map(([k, label]) => `
+          <button class="plain${state.view === k ? ' on' : ''}" data-view="${k}" aria-pressed="${state.view === k}">${label}</button>`).join('')}
+        </div>
+      </div>
     </div>
+    ${body}
   </section>`;
+}
+
+// ---------- kanban ----------
+
+// In motion and stalled come from git activity, so they share the Active column.
+const COLUMNS = [
+  ['focus', 'Focus', 'blue', 'what you work on this week'],
+  ['active', 'Active', 'green', 'on the list, not in focus'],
+  ['parked', 'Parked', 'faint', 'set aside on purpose'],
+  ['done', 'Done', 'green', 'finished'],
+  ['dropped', 'Killed', 'dim-dot', 'let go on purpose'],
+];
+const columnOf = (p) => (p.status === 'active' ? (p.focus ? 'focus' : 'active') : p.status);
+const focusCount = () => state.data.projects.filter((p) => columnOf(p) === 'focus').length;
+
+function card(p) {
+  const d = derive(p);
+  const flags = [];
+  if (d.section === 'stalled') flags.push('<span class="warn">stalled</span>');
+  if (d.blockers) flags.push(`<span class="crit">⛔ ${d.blockers} blocked</span>`);
+  if (p.local.dirty) flags.push(`<span>${p.local.dirty} uncommitted</span>`);
+  const when = p.status === 'done' && p.finished ? `✓ ${fmtDay(p.finished)}` : ago(p.local.idle);
+  const ms = !d.ms.none && d.ms.title && p.status === 'active'
+    ? `<div class="card-ms"><span>${esc(d.ms.title)}</span><span class="mono">${d.ms.pct}%</span></div>${meter(d.ms.pct, d.ms.title)}` : '';
+  return `<div class="card ${d.section}" draggable="true" tabindex="0" role="button" data-name="${esc(p.name)}" data-card="${esc(p.name)}">
+    <div class="card-top">
+      <span class="name">${esc(p.name)}</span>
+      <span class="when"><span class="dot" style="background:${css(SECTION_DOT[d.section])}"></span>${esc(when)}</span>
+    </div>
+    ${ms}
+    ${p.next && p.status === 'active' ? `<div class="card-next">→ ${esc(p.next)}</div>` : ''}
+    ${flags.length ? `<div class="flags">${flags.join('')}</div>` : ''}
+  </div>`;
+}
+
+function kanban(projects, match) {
+  const idle = (a, b) => (a.local.idle ?? 1e9) - (b.local.idle ?? 1e9);
+  const order = {
+    // In-motion projects above stalled ones.
+    active: (a, b) => (derive(a).section === 'stalled') - (derive(b).section === 'stalled') || idle(a, b),
+    done: (a, b) => (b.finished || '').localeCompare(a.finished || '') || idle(a, b),
+  };
+  return `<div class="kanban-scroll"><div class="kanban">${COLUMNS.map(([k, label, color, desc]) => {
+    const all = projects.filter((p) => columnOf(p) === k);
+    const cards = all.filter(match).sort(order[k] || idle);
+    const n = k === 'focus' ? `${all.length}/${state.data.focusLimit}` : all.length;
+    return `<div class="col col-${k}" data-col="${k}">
+      <div class="col-head" title="${esc(desc)}"><span class="dot" style="background:${css(color)}"></span><span class="label">${label}</span><span class="n">${n}</span></div>
+      <div class="col-cards">${cards.length ? cards.map(card).join('') : `<div class="col-empty">${all.length ? 'No projects match.' : 'Drop a project here'}</div>`}</div>
+    </div>`;
+  }).join('')}</div></div>`;
+}
+
+// What dropping a card in each column asks the server for.
+const MOVES = {
+  focus: { focus: true },
+  active: { status: 'active', focus: false },
+  parked: { status: 'parked' },
+  done: { status: 'done' },
+  dropped: { status: 'dropped' },
+};
+
+async function moveTo(name, col) {
+  const p = project(name);
+  if (!p || columnOf(p) === col) return;
+  if (col === 'focus' && focusCount() >= state.data.focusLimit) {
+    return toast(`Focus is full (${state.data.focusLimit}). Move one out first.`, true);
+  }
+  const msg = col === 'focus' ? `★ ${name} is in focus`
+    : col === 'active' && p.status === 'active' ? `${name} left focus`
+    : STATUS_MSG[MOVES[col].status];
+  // Move the card right away: the server rescans every repo before answering.
+  Object.assign(p, col === 'focus' ? { status: 'active', focus: true } : { status: MOVES[col].status, focus: false });
+  p.finished = col === 'done' ? state.data.today : null;
+  render();
+  if (!(await update(name, MOVES[col], msg))) load();
 }
 
 function render() {
@@ -722,7 +817,7 @@ $('#app').addEventListener('click', (e) => {
     return render();
   }
   if (e.target.closest('a')) return;
-  const el = e.target.closest('[data-act],[data-star],[data-focus-it],[data-skip],[data-revive],[data-status],[data-editbtn],[data-expand],[data-tab],[data-group],[data-jump],[data-name]');
+  const el = e.target.closest('[data-act],[data-star],[data-focus-it],[data-skip],[data-revive],[data-status],[data-editbtn],[data-expand],[data-tab],[data-view],[data-group],[data-jump],[data-name]');
   if (!el) return;
   const ds = el.dataset;
   if (ds.act === 'suggest') {
@@ -758,6 +853,11 @@ $('#app').addEventListener('click', (e) => {
     state.tab = ds.tab;
     return render();
   }
+  if (ds.view) {
+    state.view = ds.view;
+    try { localStorage.setItem('pm-view', ds.view); } catch {}
+    return render();
+  }
   if (ds.group) {
     state.collapsed[ds.group] = !state.collapsed[ds.group];
     return render();
@@ -765,6 +865,7 @@ $('#app').addEventListener('click', (e) => {
   if (ds.jump) {
     if (ds.jump === 'focus') return $('#focus').scrollIntoView({ behavior: 'smooth' });
     state.tab = ds.jump;
+    state.view = 'list';
     render();
     return $('#projects').scrollIntoView({ behavior: 'smooth' });
   }
@@ -778,7 +879,48 @@ $('#app').addEventListener('keydown', (e) => {
     if (e.key === 'Escape') saveNext(input, false);
     return;
   }
-  if (e.key === 'Enter' && e.target.matches('.slot[data-name]')) openDetail(e.target.dataset.name);
+  if (e.key === 'Enter' && e.target.matches('.slot[data-name], .card[data-name]')) openDetail(e.target.dataset.name);
+});
+
+let dragged = null;
+const clearDrag = () => document.querySelectorAll('.dragging, .over, .refuse, .drag-on')
+  .forEach((el) => el.classList.remove('dragging', 'over', 'refuse', 'drag-on'));
+
+$('#app').addEventListener('dragstart', (e) => {
+  const c = e.target.closest('[data-card]');
+  if (!c) return;
+  dragged = project(c.dataset.card);
+  e.dataTransfer.effectAllowed = 'move';
+  e.dataTransfer.setData('text/plain', dragged.name);
+  c.classList.add('dragging');
+  $('.kanban').classList.add('drag-on');
+  if (!dragged.focus && focusCount() >= state.data.focusLimit) $('.col-focus').classList.add('refuse');
+});
+$('#app').addEventListener('dragend', () => {
+  dragged = null;
+  clearDrag();
+});
+$('#app').addEventListener('dragover', (e) => {
+  const col = dragged && e.target.closest('[data-col]');
+  if (!col) return;
+  e.preventDefault();
+  const refused = col.classList.contains('refuse');
+  e.dataTransfer.dropEffect = refused ? 'none' : 'move';
+  document.querySelectorAll('.col.over').forEach((el) => el !== col && el.classList.remove('over'));
+  if (!refused) col.classList.add('over');
+});
+$('#app').addEventListener('dragleave', (e) => {
+  const col = e.target.closest('[data-col]');
+  if (col && !col.contains(e.relatedTarget)) col.classList.remove('over');
+});
+$('#app').addEventListener('drop', (e) => {
+  const col = dragged && e.target.closest('[data-col]');
+  if (!col) return;
+  e.preventDefault();
+  const name = dragged.name;
+  dragged = null;
+  clearDrag();
+  moveTo(name, col.dataset.col);
 });
 
 $('#app').addEventListener('focusout', (e) => {
