@@ -151,6 +151,18 @@ function commitTip(p) {
 
 const SECTION_DOT = { motion: 'green', focus: 'green', stalled: 'amber', done: 'green', parked: 'dim-dot', archived: 'dim-dot' };
 
+const host = (url) => { try { return new URL(url).host; } catch { return url; } };
+const deployFailing = (p) => ['failure', 'error'].includes(p.links.deploy?.state);
+
+// GitHub and live-site links, shown on cards, rows and the details panel.
+function linkBits(p) {
+  const { repo, site, siteSource } = p.links;
+  const bits = [];
+  if (repo) bits.push(`<a class="lnk" href="${esc(repo)}" target="_blank" rel="noopener" draggable="false" data-tip="${esc(repo.replace('https://github.com/', ''))}">GitHub ↗</a>`);
+  if (site) bits.push(`<a class="lnk site" href="${esc(site)}" target="_blank" rel="noopener" draggable="false" data-tip="${esc(site)} · ${esc(siteSource)}">${esc(host(site))} ↗</a>`);
+  return bits;
+}
+
 function msBlock(d) {
   const { ms } = d;
   if (ms.none) {
@@ -411,8 +423,10 @@ function row(p, focusFull) {
   const flags = [];
   if (d.blockers) flags.push(`<span class="crit">⛔ ${d.blockers} blocked</span>`);
   if (d.g && d.g.decisions.length) flags.push(`<span class="warn">◆ ${plural(d.g.decisions.length, 'decision')}</span>`);
+  if (deployFailing(p)) flags.push('<span class="crit">deploy failing</span>');
   if (p.local.dirty) flags.push(`<span>${p.local.dirty} uncommitted</span>`);
   if (!flags.length) flags.push('<span>clean</span>');
+  const links = linkBits(p);
 
   const full = focusFull && !p.focus;
   const starTitle = full ? 'Focus is full' : 'Add to focus';
@@ -424,6 +438,7 @@ function row(p, focusFull) {
       <div class="proj">
         <button class="plain name" data-expand="${esc(p.name)}" aria-expanded="${open}" title="Where I left off">${esc(p.name)}<svg class="caret${open ? ' open' : ''}" width="8" height="8" viewBox="0 0 8 8" aria-hidden="true"><path d="M2.5 1.5 5.5 4l-3 2.5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
         <span class="flags">${flags.join('')}</span>
+        ${links.length ? `<span class="links">${links.join('')}</span>` : ''}
       </div>
       ${msBlock(d)}
       <div class="next-cell">${nextCell(p, d)}</div>
@@ -515,7 +530,9 @@ function card(p) {
   const flags = [];
   if (d.section === 'stalled') flags.push('<span class="warn">stalled</span>');
   if (d.blockers) flags.push(`<span class="crit">⛔ ${d.blockers} blocked</span>`);
+  if (deployFailing(p)) flags.push('<span class="crit">deploy failing</span>');
   if (p.local.dirty) flags.push(`<span>${p.local.dirty} uncommitted</span>`);
+  const links = linkBits(p);
   const when = p.status === 'done' && p.finished ? `✓ ${fmtDay(p.finished)}` : ago(p.local.idle);
   const ms = !d.ms.none && d.ms.title && p.status === 'active'
     ? `<div class="card-ms"><span>${esc(d.ms.title)}</span><span class="mono">${d.ms.pct}%</span></div>${meter(d.ms.pct, d.ms.title)}` : '';
@@ -527,6 +544,7 @@ function card(p) {
     ${ms}
     ${p.next && p.status === 'active' ? `<div class="card-next">→ ${esc(p.next)}</div>` : ''}
     ${flags.length ? `<div class="flags">${flags.join('')}</div>` : ''}
+    ${links.length ? `<div class="links">${links.join('')}</div>` : ''}
   </div>`;
 }
 
@@ -674,7 +692,8 @@ function renderDetail() {
       </div>
       <div class="d-meta">
         <span>${esc(p.displayPath)}</span>
-        ${p.repoUrl ? `<a href="${esc(p.repoUrl)}" target="_blank" rel="noopener">${esc(p.local.slug)} ↗</a>` : ''}
+        ${linkBits(p).join('')}
+        ${p.links.deploy ? `<span class="${deployFailing(p) ? 'crit' : ''}">Last deploy ${esc(p.links.deploy.state)} · ${esc(fmtDay(p.links.deploy.date))}</span>` : ''}
         <span>${plural(p.local.commits, 'commit')}</span>
         ${p.local.dirty ? `<span>${p.local.dirty} uncommitted</span>` : ''}
       </div>
@@ -685,6 +704,7 @@ function renderDetail() {
         <label class="field"><span>Next step</span><input data-field="next" value="${esc(p.next)}" placeholder="The very next concrete action, small enough to start in 5 minutes"></label>
         <label class="field"><span>Where I left off</span><input data-field="leftoff" value="${esc(p.leftoff)}" placeholder="Note for future you — what was in your head?"></label>
         <label class="field"><span>Why it matters</span><input data-field="why" value="${esc(p.why)}" placeholder="What made you start this? Future-you needs reminding"></label>
+        <label class="field"><span>Live URL</span><input data-field="site" value="${esc(p.site)}" placeholder="${p.links.site && !p.site ? `Found ${esc(p.links.site)} (${esc(p.links.siteSource)}). Type to use another` : 'Where it runs: a VPS, Vercel, itch.io…'}"></label>
         <label class="field"><span>Blocker</span><input data-field="blocker" value="${esc(p.blocker)}" placeholder="Anything outside GitHub stopping you (waiting on art, a decision…)"></label>
       </section>
       <section><h3>Roadmap${g && g.total ? `<span class="count">${g.done}/${g.total} ${d.unit}s · ${g.progress}%</span>` : ''}</h3>

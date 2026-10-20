@@ -659,6 +659,10 @@ GH_QUERY = """
 query($owner: String!, $name: String!) {
   repository(owner: $owner, name: $name) {
     url
+    homepageUrl
+    deployments(first: 20, orderBy: {field: CREATED_AT, direction: DESC}) {
+      nodes { environment createdAt latestStatus { state environmentUrl } }
+    }
     milestones(first: 50, states: [OPEN, CLOSED], orderBy: {field: NUMBER, direction: ASC}) {
       nodes {
         number title state url dueOn
@@ -689,6 +693,50 @@ def github_slug(path):
     url = git(path, "remote", "get-url", "origin")
     m = re.match(r"(?:git@github\.com:|https://github\.com/)([^/]+)/(.+?)(?:\.git)?/?$", url)
     return f"{m[1]}/{m[2]}" if m else None
+
+
+PRODUCTION = re.compile(r"^prod(uction)?$", re.I)
+
+
+def deploy_info(raw):
+    """Latest production deployment. Vercel, Netlify and GitHub Actions environments all report to GitHub."""
+    nodes = [n for n in (raw.get("deployments") or {}).get("nodes", []) if PRODUCTION.match(n.get("environment") or "")]
+    if not nodes:
+        return None
+    status = nodes[0].get("latestStatus") or {}
+    live = next((n["latestStatus"]["environmentUrl"] for n in nodes
+                 if (n.get("latestStatus") or {}).get("state") == "SUCCESS" and n["latestStatus"].get("environmentUrl")), None)
+    return {"state": (status.get("state") or "PENDING").lower(), "date": nodes[0]["createdAt"][:10], "url": live}
+
+
+def local_site(path):
+    """A live URL written in the repo itself: package.json "homepage" or a GitHub Pages CNAME."""
+    try:
+        with open(os.path.join(path, "package.json"), encoding="utf-8") as f:
+            home = json.load(f).get("homepage")
+        if isinstance(home, str) and home.startswith(("http://", "https://")):
+            return home
+    except (OSError, ValueError, AttributeError):
+        pass
+    try:
+        with open(os.path.join(path, "CNAME"), encoding="utf-8") as f:
+            host = f.read().strip()
+        return f"https://{host}" if host else None
+    except OSError:
+        return None
+
+
+def project_links(p, slug, raw):
+    """Repo and live site; a URL you set wins, then GitHub's website field, then the last good deploy."""
+    deploy = deploy_info(raw)
+    site, source = next(((url, src) for url, src in (
+        (p.get("site"), "set by you"),
+        (raw.get("homepageUrl"), "GitHub website"),
+        (deploy and deploy["url"], "latest deploy"),
+        (local_site(p["path"]), "from the repo"),
+    ) if url), (None, None))
+    repo = raw.get("url") or (f"https://github.com/{slug}" if slug else None)
+    return {"repo": repo, "site": site, "siteSource": source, "deploy": deploy}
 
 
 def fetch_github(slug):
@@ -984,7 +1032,7 @@ def board(refresh=False):
                     "next": p.get("next", ""), "why": p.get("why", ""), "blocker": p.get("blocker", ""),
                     "leftoff": p.get("leftoff", ""), "log": p.get("log", [])[-10:], "local": l,
                     "tracker": roadmap if use_roadmap else github,
-                    "repoUrl": (entry["data"].get("url") if entry else None),
+                    "site": p.get("site", ""), "links": project_links(p, l["slug"], entry["data"] if entry else {}),
                     "fetchedAt": entry["at"] if entry else None})
     weeks = [(date.today() - timedelta(days=7 * (WEEKS - 1 - i))).isoformat() for i in range(WEEKS)]
     ideas = {"cooldown": db["idea_cooldown_days"],
@@ -1083,7 +1131,7 @@ def save_settings(body):
     return 200, {"ok": True, "added": added, "forgotten": forgotten}
 
 
-EDITABLE = ("next", "why", "blocker", "leftoff")
+EDITABLE = ("next", "why", "blocker", "leftoff", "site")
 
 
 def update_project(name, changes):
@@ -1102,6 +1150,9 @@ def update_project(name, changes):
     if changes.get("status") in STATUSES and changes["status"] != p["status"]:
         change_status(p, changes["status"])
         log(p, p["status"])
+    site = str(changes.get("site", "")).strip()
+    if site and not re.match(r"https?://", site):
+        changes["site"] = "https://" + site
     for field in EDITABLE:
         if field in changes and str(changes[field]).strip() != p.get(field, ""):
             p[field] = str(changes[field]).strip()

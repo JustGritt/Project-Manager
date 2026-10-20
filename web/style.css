@@ -400,6 +400,13 @@ dialog#detail::backdrop, dialog#settings::backdrop { background: rgba(0, 0, 0, 0
 .issues span.t { flex: 1; min-width: 0; }
 .d-progress { display: flex; flex-direction: column; gap: 6px; }
 
+/* ---------- repo & site links ---------- */
+.links { display: flex; gap: 4px 12px; flex-wrap: wrap; font-size: 12px; min-width: 0; }
+.lnk { color: var(--ink-3); max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lnk:hover { color: var(--link-hover); }
+.lnk.site { color: var(--link); }
+.d-meta .crit { color: var(--red); }
+
 /* ---------- settings ---------- */
 dialog#settings { width: min(640px, calc(100vw - 32px)); }
 .btn.small { height: 30px; padding: 0 10px; font-size: 13px; }
