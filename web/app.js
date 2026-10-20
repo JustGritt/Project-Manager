@@ -966,6 +966,160 @@ dlg.addEventListener('keydown', (e) => {
 });
 dlg.addEventListener('close', () => (state.open = null));
 
+// ---------- settings ----------
+
+// The dialog edits a draft; nothing is saved until Save.
+const sdlg = $('#settings');
+const settings = { draft: null, error: '', adding: false, saving: false };
+
+async function openSettings() {
+  try {
+    const res = await fetch('/api/settings');
+    if (!res.ok) throw new Error(res.statusText);
+    settings.draft = await res.json();
+  } catch {
+    return toast('Could not load settings. Is `pm serve` still running?', true);
+  }
+  settings.error = '';
+  renderSettings();
+  sdlg.showModal();
+}
+
+function rootRow(r, i) {
+  const n = r.projects.length;
+  const meta = !r.exists ? '<span class="warn">Folder not found right now (disconnected drive?). Its projects stay on the board.</span>'
+    : n ? `${plural(n, 'project')}: ${esc(r.projects.slice(0, 6).join(', '))}${n > 6 ? `, +${n - 6} more` : ''}`
+    : 'No projects found here';
+  return `<li class="root">
+    <div class="root-main">
+      <span class="root-path mono">${esc(r.display)}</span>
+      <span class="root-meta">${meta}</span>
+      <label class="check"><input type="checkbox" data-nested="${i}"${r.nested ? ' checked' : ''}> Also look inside subfolders that aren't projects</label>
+    </div>
+    <button class="btn small" data-remove-root="${i}" aria-label="Stop scanning ${esc(r.display)}">Remove</button>
+  </li>`;
+}
+
+function renderSettings() {
+  const s = settings.draft;
+  sdlg.innerHTML = `
+    <div class="d-head">
+      <div class="d-title"><h2 id="settings-title">Settings</h2><button class="close-x" data-s="close" aria-label="Close">×</button></div>
+      <div class="d-meta">Saved in projects.json next to pm.</div>
+    </div>
+    <div class="d-body">
+      <section>
+        <h3>Folders to scan</h3>
+        <p class="s-hint">pm looks at the folders directly inside each of these. A folder counts as a project if it has
+          <span class="mono">.git</span>, <span class="mono">package.json</span>, <span class="mono">Cargo.toml</span>, <span class="mono">pyproject.toml</span>,
+          a Godot <span class="mono">project.godot</span> or Unity's <span class="mono">ProjectSettings</span>.</p>
+        <ul class="roots">${s.roots.map(rootRow).join('') || '<li class="s-hint">No folders yet. Add one below.</li>'}</ul>
+        <form class="s-add" data-s-add>
+          <input name="path" placeholder="Add a folder, e.g. Z:\\Unity Projects" aria-label="Folder to scan" autocomplete="off" spellcheck="false">
+          <button class="btn" ${settings.adding ? 'disabled' : ''}>${settings.adding ? 'Checking…' : 'Add folder'}</button>
+        </form>
+      </section>
+      <section>
+        <h3>Hidden folder names</h3>
+        <p class="s-hint">Folders with these names are never picked up. Hiding a tracked project removes it and its notes from the board.</p>
+        <div class="chips">${s.ignore.map((n, i) => `<span class="chip">${esc(n)}<button class="plain" data-unignore="${i}" aria-label="Stop hiding ${esc(n)}">×</button></span>`).join('')}</div>
+        <form class="s-add" data-s-ignore>
+          <input name="name" placeholder="Folder name to hide" aria-label="Folder name to hide" autocomplete="off" spellcheck="false">
+          <button class="btn">Hide</button>
+        </form>
+      </section>
+      <section class="s-limits">
+        <label class="field"><span>Focus slots</span><input type="number" min="1" max="9" data-s-num="focusLimit" value="${s.focusLimit}"></label>
+        <label class="field"><span>Idea cooldown (days)</span><input type="number" min="0" max="365" data-s-num="ideaCooldown" value="${s.ideaCooldown}"></label>
+      </section>
+      ${settings.error ? `<p class="s-error" role="alert">${esc(settings.error)}</p>` : ''}
+      <div class="s-foot">
+        <button class="btn" data-s="close">Cancel</button>
+        <button class="btn primary" data-s="save" ${settings.saving ? 'disabled' : ''}>${settings.saving ? 'Saving…' : 'Save'}</button>
+      </div>
+    </div>`;
+}
+
+async function previewRoot(path, nested) {
+  try {
+    const res = await fetch(`/api/settings/preview?path=${encodeURIComponent(path)}${nested ? '&nested=1' : ''}`);
+    const data = await res.json();
+    return res.ok ? data : { error: data.error };
+  } catch {
+    return { error: 'pm serve is not reachable' };
+  }
+}
+
+async function addRoot(input) {
+  settings.adding = true;
+  settings.error = '';
+  renderSettings();
+  const r = await previewRoot(input, false);
+  settings.adding = false;
+  if (r.error) settings.error = r.error;
+  else if (settings.draft.roots.some((x) => x.path.toLowerCase() === r.path.toLowerCase())) settings.error = `${r.display} is already on the list.`;
+  else settings.draft.roots.push({ path: r.path, display: r.display, exists: true, nested: false, projects: r.projects });
+  renderSettings();
+  const field = $('[data-s-add] [name="path"]', sdlg);
+  if (r.error) field.value = input;
+  field.focus();
+}
+
+async function saveSettings() {
+  const s = settings.draft;
+  settings.saving = true;
+  settings.error = '';
+  renderSettings();
+  const res = await postJson('/api/settings', {
+    roots: s.roots.map((r) => ({ path: r.path, nested: r.nested })),
+    ignore: s.ignore, focusLimit: s.focusLimit, ideaCooldown: s.ideaCooldown,
+  });
+  settings.saving = false;
+  if (!res) return renderSettings();
+  sdlg.close();
+  await load();
+  const parts = [];
+  if (res.added.length) parts.push(`added ${res.added.join(', ')}`);
+  if (res.forgotten.length) parts.push(`removed ${res.forgotten.join(', ')}`);
+  toast(parts.length ? `Saved: ${parts.join('; ')}` : 'Settings saved');
+}
+
+sdlg.addEventListener('click', async (e) => {
+  if (e.target === sdlg) return sdlg.close(); // backdrop
+  const el = e.target.closest('[data-s],[data-remove-root],[data-unignore]');
+  if (!el) return;
+  const ds = el.dataset;
+  if (ds.s === 'close') return sdlg.close();
+  if (ds.s === 'save') return saveSettings();
+  if (ds.removeRoot) settings.draft.roots.splice(Number(ds.removeRoot), 1);
+  if (ds.unignore) settings.draft.ignore.splice(Number(ds.unignore), 1);
+  renderSettings();
+});
+sdlg.addEventListener('submit', (e) => {
+  e.preventDefault();
+  const form = e.target;
+  if ('sAdd' in form.dataset && form.path.value.trim()) return addRoot(form.path.value.trim());
+  if ('sIgnore' in form.dataset && form.name.value.trim()) {
+    const name = form.name.value.trim();
+    if (!settings.draft.ignore.includes(name)) settings.draft.ignore.push(name);
+    renderSettings();
+    $('[data-s-ignore] [name="name"]', sdlg).focus();
+  }
+});
+sdlg.addEventListener('change', async (e) => {
+  const t = e.target;
+  if (t.dataset.sNum) settings.draft[t.dataset.sNum] = Number(t.value);
+  if (t.dataset.nested !== undefined) {
+    // Re-count what this folder holds with the new setting.
+    const r = settings.draft.roots[Number(t.dataset.nested)];
+    r.nested = t.checked;
+    const fresh = r.exists ? await previewRoot(r.path, r.nested) : null;
+    if (fresh && !fresh.error) r.projects = fresh.projects;
+    renderSettings();
+  }
+});
+
+$('#open-settings').addEventListener('click', openSettings);
 $('#refresh').addEventListener('click', () => load(true));
 $('#filter').addEventListener('input', (e) => {
   state.filter = e.target.value;

@@ -28,6 +28,7 @@ WEEKS = 12
 DEFAULTS = {
     "roots": ["~", "~/orca", "~/orca/projects"],
     "ignore": ["Temp", "Project-Manager", "Library", "Applications"],
+    "nested": [],  # roots where folders that aren't projects are searched one level deeper
     "focus_limit": 3,
     "idea_cooldown_days": 7,
     "projects": {},
@@ -111,19 +112,44 @@ def is_project(path):
     return any(os.path.exists(os.path.join(path, m)) for m in markers)
 
 
+def subfolders(db, path):
+    try:
+        names = sorted(os.listdir(path))
+    except OSError:  # missing root, disconnected drive, no permission
+        return []
+    return [(n, os.path.join(path, n)) for n in names
+            if not n.startswith(".") and n not in db["ignore"] and os.path.isdir(os.path.join(path, n))]
+
+
+def scan_root(db, root, nested=None):
+    """Projects directly inside root; nested roots also look one level inside folders that aren't projects."""
+    if nested is None:
+        nested = same_path(root, db["nested"])
+    found = {}
+    for name, path in subfolders(db, os.path.expanduser(root)):
+        if is_project(path):
+            found.setdefault(name, path)
+        elif nested:
+            for sub, subpath in subfolders(db, path):
+                if is_project(subpath):
+                    found.setdefault(sub, subpath)
+    return found
+
+
 def discover(db):
     found = {}
     for root in db["roots"]:
-        root = os.path.expanduser(root)
-        if not os.path.isdir(root):
-            continue
-        for name in sorted(os.listdir(root)):
-            path = os.path.join(root, name)
-            if name.startswith(".") or name in db["ignore"] or not os.path.isdir(path):
-                continue
-            if is_project(path):
-                found.setdefault(name, path)
+        for name, path in scan_root(db, root).items():
+            found.setdefault(name, path)
     return found
+
+
+def norm(path):
+    return os.path.normcase(os.path.abspath(os.path.expanduser(path)))
+
+
+def same_path(path, paths):
+    return norm(path) in {norm(p) for p in paths}
 
 
 def activity(path):
@@ -990,6 +1016,73 @@ def idea_action(iid, body):
     return 200, result
 
 
+def settings_view(db):
+    names = {norm(p["path"]): n for n, p in db["projects"].items()}
+    roots = []
+    for root in db["roots"]:
+        found = scan_root(db, root)
+        roots.append({"path": root, "display": tilde(os.path.normpath(os.path.expanduser(root))), "exists": os.path.isdir(os.path.expanduser(root)),
+                      "nested": same_path(root, db["nested"]),
+                      "projects": sorted(names.get(norm(p), n) for n, p in found.items())})
+    return {"roots": roots, "ignore": db["ignore"], "focusLimit": db["focus_limit"],
+            "ideaCooldown": db["idea_cooldown_days"]}
+
+
+def preview_root(path, nested):
+    db = load()
+    full = os.path.abspath(os.path.expanduser(path.strip()))
+    if not path.strip() or not os.path.isdir(full):
+        return 404, {"error": f"No folder at {full}" if path.strip() else "Enter a folder path."}
+    return 200, {"path": full, "display": tilde(full), "projects": sorted(scan_root(db, full, nested))}
+
+
+def pristine(p):
+    """A project pm found on its own that you never touched: safe to forget."""
+    return (p["status"] == "active" and not p.get("focus") and not p.get("log")
+            and not any(p.get(k) for k in ("next", "why", "leftoff", "blocker")))
+
+
+def save_settings(body):
+    db = load()
+    try:
+        roots = [(str(r["path"]).strip(), bool(r.get("nested"))) for r in body["roots"]]
+        ignore = list(dict.fromkeys(str(n).strip() for n in body["ignore"] if str(n).strip()))
+        focus_limit, cooldown = int(body["focusLimit"]), int(body["ideaCooldown"])
+    except (KeyError, TypeError, ValueError):
+        return 400, {"error": "bad request"}
+    if not 1 <= focus_limit <= 9:
+        return 400, {"error": "Focus slots must be between 1 and 9."}
+    if not 0 <= cooldown <= 365:
+        return 400, {"error": "The idea cooldown must be between 0 and 365 days."}
+    kept = []
+    for path, nested in roots:
+        # Folders already on the list may be on a disconnected drive; new ones have to exist.
+        if not same_path(path, db["roots"]):
+            path = os.path.abspath(os.path.expanduser(path))
+            if not os.path.isdir(path):
+                return 400, {"error": f"No folder at {path}"}
+        if not same_path(path, [p for p, _ in kept]):
+            kept.append((path, nested))
+
+    removed_roots = [r for r in db["roots"] if not same_path(r, [p for p, _ in kept])]
+    newly_ignored = set(ignore) - set(db["ignore"])
+    db["roots"] = [p for p, _ in kept]
+    db["nested"] = [p for p, n in kept if n]
+    db["ignore"], db["focus_limit"], db["idea_cooldown_days"] = ignore, focus_limit, cooldown
+
+    # Forget projects that only came from a removed folder, unless you've written anything about them.
+    still_found = {norm(p) for p in discover(db).values()}
+    forgotten = []
+    for name, p in list(db["projects"].items()):
+        from_removed = any(norm(p["path"]).startswith(norm(r) + os.sep) for r in removed_roots)
+        if name in newly_ignored or (from_removed and norm(p["path"]) not in still_found and pristine(p)):
+            del db["projects"][name]
+            forgotten.append(name)
+    added = sync(db, quiet=True)
+    save(db)
+    return 200, {"ok": True, "added": added, "forgotten": forgotten}
+
+
 EDITABLE = ("next", "why", "blocker", "leftoff")
 
 
@@ -1059,6 +1152,11 @@ def cmd_serve(db, args):
                 return self.send(200, quick_status(port))
             if url.path == "/api/board":
                 return self.send(200, board(refresh="refresh" in parse_qs(url.query)))
+            if url.path == "/api/settings":
+                return self.send(200, settings_view(load()))
+            if url.path == "/api/settings/preview":
+                q = parse_qs(url.query)
+                return self.send(*preview_root(q.get("path", [""])[0], q.get("nested") == ["1"]))
             name = "index.html" if url.path == "/" else os.path.basename(url.path)
             file = os.path.join(WEB, name)
             if not os.path.isfile(file):
@@ -1072,7 +1170,8 @@ def cmd_serve(db, args):
             path = urlparse(self.path).path
             m = re.fullmatch(r"/api/projects/([^/]+)(/task)?", path)
             idea = re.fullmatch(r"/api/ideas(?:/(\d+))?", path)
-            if not m and not idea:
+            settings = path == "/api/settings"
+            if not m and not idea and not settings:
                 return self.send(404, {"error": "not found"})
             try:
                 body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
@@ -1081,7 +1180,9 @@ def cmd_serve(db, args):
             except (ValueError, KeyError, TypeError, AttributeError):
                 return self.send(400, {"error": "bad request"})
             with write_lock:
-                if idea:
+                if settings:
+                    self.send(*save_settings(body))
+                elif idea:
                     self.send(*idea_action(idea[1], body))
                 elif m[2]:
                     self.send(*toggle_task(unquote(m[1]), *task))
