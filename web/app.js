@@ -61,6 +61,7 @@ function derive(p) {
   const hasRoadmap = !!g && g.milestones.some((m) => m.total);
   const blockers = (g ? g.blockers.length : 0) + (p.blocker ? 1 : 0);
   const section = p.status === 'parked' ? 'parked'
+    : p.status === 'done' ? 'done'
     : p.status !== 'active' ? 'archived'
     : p.focus ? 'focus'
     : p.local.health === 'stalled' || p.local.health === 'unknown' ? 'stalled'
@@ -145,7 +146,7 @@ function commitTip(p) {
   return (v, i) => `${weekRange(i)}: ${plural(v, 'commit')}${closed ? `, ${plural(closed[i], d.unit)} closed` : ''}`;
 }
 
-const SECTION_DOT = { motion: 'green', focus: 'green', stalled: 'amber', parked: 'dim-dot', archived: 'dim-dot' };
+const SECTION_DOT = { motion: 'green', focus: 'green', stalled: 'amber', done: 'green', parked: 'dim-dot', archived: 'dim-dot' };
 
 function msBlock(d) {
   const { ms } = d;
@@ -350,8 +351,9 @@ function ideasBlock(projects) {
 const GROUPS = {
   motion: ['In motion', 'green', 'touched in the last 3 weeks'],
   stalled: ['Stalled', 'amber', 'no activity for 3+ weeks — revive, park or kill'],
+  done: ['Done', 'green', 'finished — the ones that made it'],
   parked: ['Parked', 'faint', 'set aside on purpose'],
-  archived: ['Archived', 'dim-dot', 'done or killed — restore anytime'],
+  archived: ['Killed', 'dim-dot', 'let go on purpose — restore anytime'],
 };
 
 function nextCell(p, d) {
@@ -360,6 +362,14 @@ function nextCell(p, d) {
       <button class="plain tri revive" data-revive="${esc(p.name)}" data-tip="Move back into focus">Revive</button>
       <button class="plain tri park" data-status="parked" data-who="${esc(p.name)}" data-tip="Set aside on purpose">Park</button>
       <button class="plain tri kill" data-status="dropped" data-who="${esc(p.name)}" data-tip="Archive for good">Kill</button>
+    </div>`;
+  }
+  if (d.section === 'done') {
+    // Projects marked done before pm recorded the day fall back to their last commit.
+    const when = p.finished ? fmtDay(p.finished) : p.local.last ? fmtDay(p.local.last.slice(0, 10)) : null;
+    return `<div class="triage">
+      <span class="finished">✓ Finished${when ? ` ${esc(when)}` : ''}</span>
+      <button class="plain tri park" data-status="active" data-who="${esc(p.name)}" data-tip="Back on the active list">↺ Reopen</button>
     </div>`;
   }
   if (d.section === 'parked' || d.section === 'archived') {
@@ -399,7 +409,6 @@ function row(p, focusFull) {
   if (d.blockers) flags.push(`<span class="crit">⛔ ${d.blockers} blocked</span>`);
   if (d.g && d.g.decisions.length) flags.push(`<span class="warn">◆ ${plural(d.g.decisions.length, 'decision')}</span>`);
   if (p.local.dirty) flags.push(`<span>${p.local.dirty} uncommitted</span>`);
-  if (d.section === 'archived') flags.unshift(`<span>${p.status === 'done' ? 'done' : 'killed'}</span>`);
   if (!flags.length) flags.push('<span>clean</span>');
 
   const full = focusFull && !p.focus;
@@ -428,17 +437,19 @@ function table(projects) {
   const by = (s) => projects.filter((p) => derive(p).section === s);
   const idle = (a, b) => (a.local.idle ?? 1e9) - (b.local.idle ?? 1e9);
   // Stalled projects closest to done first: they're the cheapest to revive.
+  const finished = (a, b) => (b.finished || '').localeCompare(a.finished || '') || idle(a, b);
   const closest = (a, b) => (derive(b).ms.pct ?? -1) - (derive(a).ms.pct ?? -1) || idle(a, b);
-  const lists = { motion: by('motion').sort(idle), stalled: by('stalled').sort(closest), parked: by('parked').sort(idle), archived: by('archived').sort(idle) };
+  const lists = { motion: by('motion').sort(idle), stalled: by('stalled').sort(closest), done: by('done').sort(finished), parked: by('parked').sort(idle), archived: by('archived').sort(idle) };
   const focusFull = by('focus').length >= state.data.focusLimit;
 
   const tabs = [
-    ['all', 'All', lists.motion.length + lists.stalled.length + lists.parked.length + lists.archived.length],
+    ['all', 'All', Object.values(lists).reduce((n, l) => n + l.length, 0)],
     ['motion', 'In motion', lists.motion.length],
     ['stalled', 'Stalled', lists.stalled.length],
+    ['done', 'Done', lists.done.length],
   ];
   const shown = state.tab === 'all'
-    ? ['motion', 'stalled', 'parked', 'archived'].filter((k) => k === 'motion' || k === 'stalled' || lists[k].length)
+    ? ['motion', 'stalled', 'done', 'parked', 'archived'].filter((k) => k === 'motion' || k === 'stalled' || lists[k].length)
     : [state.tab];
 
   return `<section class="block" id="projects">
@@ -520,7 +531,7 @@ function renderDetail() {
        <button class="btn" data-act="status" data-v="parked">Park</button>
        <button class="btn" data-act="status" data-v="done">Mark done</button>
        <button class="btn danger" data-act="status" data-v="dropped">Kill</button>`
-    : `<button class="btn primary" data-act="status" data-v="active">↺ Restore</button>
+    : `<button class="btn primary" data-act="status" data-v="active">${p.status === 'done' ? '↺ Reopen' : '↺ Restore'}</button>
        <span class="d-meta">This project is ${p.status === 'dropped' ? 'killed' : esc(p.status)}.</span>`;
 
   let progressHtml;
@@ -636,7 +647,7 @@ const STATUS_MSG = {
   parked: 'Parked. It will wait, guilt-free.',
   done: 'Done. Nice work! 🎉',
   dropped: 'Killed. Letting go is a decision, not a failure.',
-  active: 'Restored to the board.',
+  active: 'Back on the board.',
 };
 
 function toggleFocus(p) {

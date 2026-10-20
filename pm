@@ -81,6 +81,17 @@ def log(p, note):
     p.setdefault("log", []).append({"date": today(), "note": note})
 
 
+def change_status(p, status):
+    """Set a project's status; done projects remember the day they were finished."""
+    p["status"] = status
+    if status != "active":
+        p["focus"] = False
+    if status == "done":
+        p["finished"] = today()
+    else:
+        p.pop("finished", None)
+
+
 # ---------- discovery & activity ----------
 
 # Under pythonw (background board) every child process would flash a console window on Windows.
@@ -197,7 +208,8 @@ def try_focus(db, name):
     if len(focused) >= db["focus_limit"]:
         return f"Focus is full ({', '.join(focused)}). Finish, park, or unfocus one first."
     p = db["projects"][name]
-    p["focus"], p["status"] = True, "active"
+    change_status(p, "active")
+    p["focus"] = True
     log(p, "focused")
     return None
 
@@ -386,9 +398,7 @@ def set_status(status, verb):
         need(args, 1, f"{verb} <name> [note]")
         name, p = find(db, args[0])
         note = " ".join(args[1:])
-        p["status"] = status
-        if status != "active":
-            p["focus"] = False
+        change_status(p, status)
         log(p, f"{status}" + (f": {note}" if note else ""))
         save(db)
         msg = {"parked": "parked. It'll wait, guilt-free.", "done": "is DONE. Nice.",
@@ -570,7 +580,7 @@ def cmd_review(db, args):
                 print(col(f"  {err} Kept instead.", "y"))
         elif choice in ("p", "d", "x"):
             status = {"p": "parked", "d": "dropped", "x": "done"}[choice]
-            p["status"], p["focus"] = status, False
+            change_status(p, status)
             note = ask("  one-line note (optional) > ")
             log(p, f"{status} (review)" + (f": {note}" if note else ""))
             print()
@@ -944,7 +954,7 @@ def board(refresh=False):
         github = summarize_github(entry["data"]) if entry else None
         # GitHub issues win, unless a roadmap file was chosen explicitly or there are no issues.
         use_roadmap = roadmap and (p.get("roadmap") or not github or github.get("error") or not github["total"])
-        out.append({"name": n, "path": p["path"], "displayPath": tilde(p["path"]), "status": p["status"], "focus": bool(p.get("focus")),
+        out.append({"name": n, "path": p["path"], "displayPath": tilde(p["path"]), "status": p["status"], "focus": bool(p.get("focus")), "finished": p.get("finished"),
                     "next": p.get("next", ""), "why": p.get("why", ""), "blocker": p.get("blocker", ""),
                     "leftoff": p.get("leftoff", ""), "log": p.get("log", [])[-10:], "local": l,
                     "tracker": roadmap if use_roadmap else github,
@@ -997,9 +1007,7 @@ def update_project(name, changes):
             p["focus"] = False
             log(p, "unfocused")
     if changes.get("status") in STATUSES and changes["status"] != p["status"]:
-        p["status"] = changes["status"]
-        if p["status"] != "active":
-            p["focus"] = False
+        change_status(p, changes["status"])
         log(p, p["status"])
     for field in EDITABLE:
         if field in changes and str(changes[field]).strip() != p.get(field, ""):

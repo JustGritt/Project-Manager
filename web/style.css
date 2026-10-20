@@ -291,6 +291,7 @@ input::placeholder { color: #6b6b6b; }
 .last { display: flex; justify-content: flex-end; align-items: center; gap: 6px; font-size: 13px; color: var(--ink-2); white-space: nowrap; }
 .row.stalled .last { color: var(--amber); }
 .row.parked .last, .row.archived .last { color: var(--muted); }
+.row.done .last { color: var(--green); }
 
 /* triage buttons on stalled / shelved rows */
 .triage { display: flex; gap: 6px; flex-wrap: wrap; }
@@ -300,6 +301,7 @@ input::placeholder { color: #6b6b6b; }
 .tri.park { background: var(--surface-2); color: #bdbdbd; }
 .tri.park:hover { background: #262626; }
 .tri.kill { color: oklch(0.72 0.14 25); }
+.finished { align-self: center; font-size: 12px; color: var(--green); white-space: nowrap; }
 .tri.kill:hover { background: #241515; }
 
 /* "where I left off" panel */
