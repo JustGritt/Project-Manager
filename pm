@@ -622,14 +622,37 @@ def cmd_review(db, args):
     print(col("Review saved. Run `pm` to see the board.", "g"))
 
 
-def cmd_add(db, args):
-    need(args, 1, "add <path> [name]")
-    path = os.path.abspath(os.path.expanduser(args[0]))
+def add_project(db, path, name=""):
+    """Track any folder, wherever it lives. Raises ValueError with a message for the user."""
+    path = os.path.abspath(os.path.expanduser(path.strip().strip('"')))  # Explorer's "Copy as path" adds quotes
     if not os.path.isdir(path):
-        sys.exit(f"Not a directory: {path}")
-    name = args[1] if len(args) > 1 else os.path.basename(path)
+        raise ValueError(f"No folder at {path}")
+    tracked = next((n for n, p in db["projects"].items() if norm(p["path"]) == norm(path)), None)
+    if tracked:
+        raise ValueError(f"That folder is already on the board as {tracked}.")
+    name = name.strip() or os.path.basename(path.rstrip("\\/")) or path
+    if name in db["projects"]:
+        raise ValueError(f"There's already a project named {name}. Pick another name.")
     db["projects"][name] = {"path": path, "status": "active", "focus": False,
                             "next": "", "why": "", "added": today(), "log": []}
+    return name
+
+
+def remove_project(db, name):
+    """Stop tracking a project. One that pm found in a scanned folder is also hidden, or the next scan brings it back."""
+    p = db["projects"].pop(name)
+    hidden = norm(p["path"]) in {norm(q) for q in discover(db).values()}
+    if hidden and os.path.basename(p["path"]) not in db["ignore"]:
+        db["ignore"].append(os.path.basename(p["path"]))
+    return hidden
+
+
+def cmd_add(db, args):
+    need(args, 1, "add <path> [name]")
+    try:
+        name = add_project(db, args[0], args[1] if len(args) > 1 else "")
+    except ValueError as e:
+        sys.exit(str(e))
     save(db)
     print(f"Added {name}.")
 
@@ -1134,10 +1157,44 @@ def save_settings(body):
 EDITABLE = ("next", "why", "blocker", "leftoff", "site")
 
 
+def new_project(body):
+    db = load()
+    try:
+        name = add_project(db, str(body.get("path", "")), str(body.get("name", "")))
+    except ValueError as e:
+        return 409, {"error": str(e)}
+    save(db)
+    return 200, {"ok": True, "name": name}
+
+
+PICKER = """import sys, tkinter, tkinter.filedialog
+root = tkinter.Tk()
+root.withdraw()
+root.attributes("-topmost", True)
+print(tkinter.filedialog.askdirectory(parent=root, title="Choose a project folder", initialdir=sys.argv[1]) or "")"""
+
+
+def pick_folder():
+    """A native folder dialog, in its own process: Tk wants a main thread and the server's is busy."""
+    try:
+        out = subprocess.run([sys.executable, "-c", PICKER, os.path.expanduser("~")],
+                             capture_output=True, encoding="utf-8", timeout=600, **NO_WINDOW)
+    except (OSError, subprocess.TimeoutExpired):
+        out = None
+    if not out or out.returncode != 0:
+        return 500, {"error": "Couldn't open a folder picker here. Paste the folder path instead."}
+    path = out.stdout.strip()
+    return 200, {"path": os.path.normpath(path) if path else ""}
+
+
 def update_project(name, changes):
     db = load()
     if name not in db["projects"]:
         return 404, {"error": f"No project named {name}"}
+    if changes.get("remove"):
+        hidden = remove_project(db, name)
+        save(db)
+        return 200, {"ok": True, "hidden": hidden}
     p = db["projects"][name]
     if "focus" in changes:
         if changes["focus"]:
@@ -1222,7 +1279,9 @@ def cmd_serve(db, args):
             m = re.fullmatch(r"/api/projects/([^/]+)(/task)?", path)
             idea = re.fullmatch(r"/api/ideas(?:/(\d+))?", path)
             settings = path == "/api/settings"
-            if not m and not idea and not settings:
+            if path == "/api/pick-folder":
+                return self.send(*pick_folder())  # waits on the person, so outside the write lock
+            if not m and not idea and not settings and path != "/api/projects":
                 return self.send(404, {"error": "not found"})
             try:
                 body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
@@ -1233,6 +1292,8 @@ def cmd_serve(db, args):
             with write_lock:
                 if settings:
                     self.send(*save_settings(body))
+                elif not m and not idea:
+                    self.send(*new_project(body))
                 elif idea:
                     self.send(*idea_action(idea[1], body))
                 elif m[2]:

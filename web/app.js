@@ -47,6 +47,38 @@ async function postJson(path, body) {
 
 const post = async (path, body) => !!(await postJson(path, body));
 
+// For dialogs: a toast would sit under the modal, so return the error to show inline.
+async function postInline(path, body) {
+  try {
+    const res = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    const data = await res.json();
+    return res.ok ? data : { error: data.error || 'Save failed' };
+  } catch {
+    return { error: 'pm serve is not reachable' };
+  }
+}
+
+// "Browse…" opens a native folder dialog on this machine and fills the input next to the button.
+async function pickFolder(btn) {
+  const input = btn.parentElement.querySelector('input');
+  const label = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Choose in the dialog…';
+  const res = await postInline('/api/pick-folder', {});
+  btn.disabled = false;
+  btn.textContent = label;
+  if (res.error) return toast(res.error, true);
+  if (res.path) {
+    input.value = res.path;
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+  }
+  input.focus();
+}
+document.addEventListener('click', (e) => {
+  const btn = e.target.closest('[data-pick]');
+  if (btn) pickFolder(btn);
+});
+
 async function update(name, changes, okMsg) {
   const ok = await post('/api/projects/' + encodeURIComponent(name), changes);
   if (!ok) return false;
@@ -503,6 +535,7 @@ function projectsBlock(body) {
       <h2>All projects<span>${state.data.projects.length}</span></h2>
       <div class="block-tools">
         ${state.view === 'board' ? '<span class="hint">Drag a card to change its status</span>' : ''}
+        <button class="btn small" data-act="add-project">+ Add project</button>
         <div class="seg" role="group" aria-label="View">${views.map(([k, label]) => `
           <button class="plain${state.view === k ? ' on' : ''}" data-view="${k}" aria-pressed="${state.view === k}">${label}</button>`).join('')}
         </div>
@@ -646,6 +679,10 @@ function renderDetail() {
        <button class="btn danger" data-act="status" data-v="dropped">Kill</button>`
     : `<button class="btn primary" data-act="status" data-v="active">${p.status === 'done' ? '↺ Reopen' : '↺ Restore'}</button>
        <span class="d-meta">This project is ${p.status === 'dropped' ? 'killed' : esc(p.status)}.</span>`;
+  // Two clicks, so a stray one can't take a project and its notes off the board.
+  const removeBtn = state.removing === p.name
+    ? '<button class="btn danger-solid" data-act="remove">Click again to remove</button>'
+    : '<button class="btn quiet" data-act="remove" data-tip="Stop tracking it. The folder itself is not touched.">Remove from board</button>';
 
   let progressHtml;
   if (!g) {
@@ -697,7 +734,7 @@ function renderDetail() {
         <span>${plural(p.local.commits, 'commit')}</span>
         ${p.local.dirty ? `<span>${p.local.dirty} uncommitted</span>` : ''}
       </div>
-      <div class="d-actions">${actions}</div>
+      <div class="d-actions">${actions}<span class="d-push"></span>${removeBtn}</div>
     </div>
     <div class="d-body">
       <section class="fields">
@@ -725,6 +762,7 @@ function renderDetail() {
 }
 
 function openDetail(name) {
+  if (state.open !== name) state.removing = null;
   state.open = name;
   renderDetail();
   $('#detail').scrollTop = 0;
@@ -850,6 +888,7 @@ $('#app').addEventListener('click', (e) => {
     return render();
   }
   if (ds.act === 'accept-all') return acceptAll();
+  if (ds.act === 'add-project') return openAddProject();
   if (ds.star) {
     if (el.classList.contains('full')) return toast(`Focus is full (${state.data.focusLimit}). Unstar one first.`, true);
     return toggleFocus(project(ds.star));
@@ -974,6 +1013,7 @@ dlg.addEventListener('click', async (e) => {
   if (act === 'close') dlg.close();
   if (act === 'focus') toggleFocus(p);
   if (act === 'status') update(p.name, { status: btn.dataset.v }, STATUS_MSG[btn.dataset.v]);
+  if (act === 'remove') removeProject(p);
 });
 dlg.addEventListener('change', (e) => {
   const f = e.target.dataset.field;
@@ -984,7 +1024,24 @@ dlg.addEventListener('keydown', (e) => {
   if (e.target.dataset.field) e.target.blur();
   if (e.target.hasAttribute('data-note') && e.target.value.trim()) update(state.open, { note: e.target.value }, 'Noted');
 });
-dlg.addEventListener('close', () => (state.open = null));
+dlg.addEventListener('close', () => {
+  state.open = null;
+  state.removing = null;
+});
+
+async function removeProject(p) {
+  if (state.removing !== p.name) {
+    state.removing = p.name;
+    return renderDetail();
+  }
+  const res = await postJson('/api/projects/' + encodeURIComponent(p.name), { remove: true });
+  if (!res) return;
+  dlg.close();
+  await load();
+  toast(res.hidden
+    ? `${p.name} removed. Its folder name is now hidden from scans; undo that in Settings.`
+    : `${p.name} removed from the board. The folder wasn't touched.`);
+}
 
 // ---------- settings ----------
 
@@ -1036,6 +1093,7 @@ function renderSettings() {
         <ul class="roots">${s.roots.map(rootRow).join('') || '<li class="s-hint">No folders yet. Add one below.</li>'}</ul>
         <form class="s-add" data-s-add>
           <input name="path" placeholder="Add a folder, e.g. Z:\\Unity Projects" aria-label="Folder to scan" autocomplete="off" spellcheck="false">
+          <button type="button" class="btn" data-pick>Browse…</button>
           <button class="btn" ${settings.adding ? 'disabled' : ''}>${settings.adding ? 'Checking…' : 'Add folder'}</button>
         </form>
       </section>
@@ -1090,12 +1148,15 @@ async function saveSettings() {
   settings.saving = true;
   settings.error = '';
   renderSettings();
-  const res = await postJson('/api/settings', {
+  const res = await postInline('/api/settings', {
     roots: s.roots.map((r) => ({ path: r.path, nested: r.nested })),
     ignore: s.ignore, focusLimit: s.focusLimit, ideaCooldown: s.ideaCooldown,
   });
   settings.saving = false;
-  if (!res) return renderSettings();
+  if (res.error) {
+    settings.error = res.error;
+    return renderSettings();
+  }
   sdlg.close();
   await load();
   const parts = [];
@@ -1137,6 +1198,60 @@ sdlg.addEventListener('change', async (e) => {
     if (fresh && !fresh.error) r.projects = fresh.projects;
     renderSettings();
   }
+});
+
+// ---------- add a project ----------
+
+// For one-off folders outside the scanned ones, like a project sitting in Downloads.
+const adlg = $('#addproj');
+const basename = (path) => path.replace(/["\\/]+$/, '').split(/[\\/]/).pop().replace(/^"/, '');
+
+function openAddProject() {
+  adlg.innerHTML = `
+    <div class="d-head">
+      <div class="d-title"><h2 id="addproj-title">Add a project</h2><button class="close-x" data-a="close" aria-label="Close">×</button></div>
+      <div class="d-meta">Any folder, wherever it is: Downloads, Desktop, another drive. It stays on the board until you remove it.</div>
+    </div>
+    <form class="d-body a-form" data-addp>
+      <label class="field"><span>Folder</span>
+        <div class="s-add">
+          <input name="path" required placeholder="e.g. C:\\Users\\you\\Downloads\\my-game" autocomplete="off" spellcheck="false">
+          <button type="button" class="btn" data-pick>Browse…</button>
+        </div>
+      </label>
+      <label class="field"><span>Name</span><input name="name" placeholder="Defaults to the folder name" autocomplete="off"></label>
+      <p class="s-error" role="alert" hidden></p>
+      <div class="s-foot">
+        <button type="button" class="btn" data-a="close">Cancel</button>
+        <button class="btn primary">Add project</button>
+      </div>
+    </form>`;
+  adlg.showModal();
+  $('[name="path"]', adlg).focus();
+}
+
+adlg.addEventListener('click', (e) => {
+  if (e.target === adlg || e.target.closest('[data-a="close"]')) adlg.close();
+});
+adlg.addEventListener('input', (e) => {
+  if (e.target.name === 'path') $('[name="name"]', adlg).placeholder = basename(e.target.value.trim()) || 'Defaults to the folder name';
+});
+adlg.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const form = e.target;
+  const submit = form.querySelector('.btn.primary');
+  submit.disabled = true;
+  const res = await postInline('/api/projects', { path: form.path.value, name: form.name.value });
+  submit.disabled = false;
+  if (res.error) {
+    const err = $('.s-error', adlg);
+    err.textContent = res.error;
+    err.hidden = false;
+    return;
+  }
+  adlg.close();
+  await load();
+  toast(`${res.name} added to the board`);
 });
 
 $('#open-settings').addEventListener('click', openSettings);

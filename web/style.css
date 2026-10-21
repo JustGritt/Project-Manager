@@ -336,7 +336,7 @@ input::placeholder { color: #6b6b6b; }
 .empty-row { padding: 14px 12px; border-top: 1px solid var(--grid); font-size: 13px; color: var(--faint); }
 
 /* ---------- detail dialog ---------- */
-dialog#detail, dialog#settings {
+dialog#detail, dialog#settings, dialog#addproj {
   width: min(760px, calc(100vw - 32px));
   max-height: calc(100vh - 48px);
   padding: 0;
@@ -346,7 +346,7 @@ dialog#detail, dialog#settings {
   color: var(--ink);
   box-shadow: 0 24px 64px rgba(0, 0, 0, 0.5);
 }
-dialog#detail::backdrop, dialog#settings::backdrop { background: rgba(0, 0, 0, 0.6); }
+dialog#detail::backdrop, dialog#settings::backdrop, dialog#addproj::backdrop { background: rgba(0, 0, 0, 0.6); }
 .d-head { position: sticky; top: 0; z-index: 1; background: var(--surface); padding: 18px 20px 14px; border-bottom: 1px solid var(--border); }
 .d-title { display: flex; align-items: center; gap: 10px; }
 .d-title h2:focus { outline: none; }
@@ -430,6 +430,15 @@ dialog#settings { width: min(640px, calc(100vw - 32px)); }
 .s-limits { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }
 .s-error { margin: 18px 0 0; padding: 10px 12px; border-radius: 8px; background: #241515; color: oklch(0.8 0.1 25); font-size: 13px; }
 .s-foot { display: flex; justify-content: flex-end; gap: 8px; margin-top: 24px; }
+
+/* ---------- add / remove a project ---------- */
+dialog#addproj { width: min(560px, calc(100vw - 32px)); }
+.a-form { display: flex; flex-direction: column; gap: 14px; padding-top: 18px; }
+.a-form .s-error, .a-form .s-foot { margin-top: 0; }
+.d-push { flex: 1; }
+.btn.quiet { background: transparent; border-color: transparent; color: var(--muted); }
+.btn.quiet:hover { color: var(--red); background: var(--surface-2); }
+.btn.danger-solid { background: var(--red); border-color: transparent; color: #fff; font-weight: 500; }
 
 /* ---------- view toggle & kanban ---------- */
 .seg { display: inline-flex; padding: 2px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }
