@@ -67,13 +67,28 @@ async function pickFolder(btn) {
   const res = await postInline('/api/pick-folder', {});
   btn.disabled = false;
   btn.textContent = label;
-  if (res.error) return toast(res.error, true);
+  if (res.error) return showPickError(btn, input, res.error);
   if (res.path) {
     input.value = res.path;
     input.dispatchEvent(new Event('input', { bubbles: true }));
   }
   input.focus();
 }
+
+// Browse only exists inside dialogs, where a toast would be hidden behind the modal.
+function showPickError(btn, input, msg) {
+  if (btn.closest('#settings')) {
+    const typed = input.value;
+    settings.error = msg;
+    renderSettings();
+    $('[data-s-add] [name="path"]', sdlg).value = typed;
+  } else {
+    const err = $('.s-error', adlg);
+    err.textContent = msg;
+    err.hidden = false;
+  }
+}
+
 document.addEventListener('click', (e) => {
   const btn = e.target.closest('[data-pick]');
   if (btn) pickFolder(btn);

@@ -1173,12 +1173,29 @@ root.withdraw()
 root.attributes("-topmost", True)
 print(tkinter.filedialog.askdirectory(parent=root, title="Choose a project folder", initialdir=sys.argv[1]) or "")"""
 
+# Homebrew's Python has no tkinter, so macOS uses its own open panel. AppKit's constants reach
+# JavaScript as strings here, hence == rather than ===.
+PICKER_MAC = """ObjC.import("AppKit");
+function run(argv) {
+  const app = $.NSApplication.sharedApplication;
+  app.setActivationPolicy($.NSApplicationActivationPolicyAccessory);
+  app.activateIgnoringOtherApps(true);
+  const panel = $.NSOpenPanel.openPanel;
+  panel.canChooseFiles = false;
+  panel.canChooseDirectories = true;
+  panel.message = "Choose a project folder";
+  panel.directoryURL = $.NSURL.fileURLWithPath(argv[0]);
+  return panel.runModal == $.NSModalResponseOK ? panel.URL.path.js : "";
+}"""
+
 
 def pick_folder():
     """A native folder dialog, in its own process: Tk wants a main thread and the server's is busy."""
+    home = os.path.expanduser("~")
+    argv = (["osascript", "-l", "JavaScript", "-e", PICKER_MAC, home] if sys.platform == "darwin"
+            else [sys.executable, "-c", PICKER, home])
     try:
-        out = subprocess.run([sys.executable, "-c", PICKER, os.path.expanduser("~")],
-                             capture_output=True, encoding="utf-8", timeout=600, **NO_WINDOW)
+        out = subprocess.run(argv, capture_output=True, encoding="utf-8", timeout=600, **NO_WINDOW)
     except (OSError, subprocess.TimeoutExpired):
         out = None
     if not out or out.returncode != 0:
