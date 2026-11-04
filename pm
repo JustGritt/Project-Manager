@@ -15,11 +15,38 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from urllib.parse import unquote, urlparse, parse_qs
 
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
+
 HERE = os.path.dirname(os.path.realpath(__file__))
-DATA = os.path.join(HERE, "projects.json")
+
+
+def data_dir():
+    """Your notes live outside the code, so deleting or recloning the repo can't take them with it."""
+    if os.environ.get("PM_HOME"):  # keeps tests away from your real data
+        return os.path.abspath(os.path.expanduser(os.environ["PM_HOME"]))
+    home = os.path.expanduser("~")
+    if sys.platform == "darwin":
+        return os.path.join(home, "Library", "Application Support", "pm")
+    if os.name == "nt":
+        return os.path.join(os.environ.get("APPDATA") or home, "pm")
+    return os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.join(home, ".local", "share"), "pm")
+
+
+DATA_DIR = data_dir()
+DATA = os.path.join(DATA_DIR, "projects.json")
+OLD_DATA = os.path.join(HERE, "projects.json")  # where it lived before it moved out of the repo
+BACKUPS = os.path.join(DATA_DIR, "backups")
+BACKUP_NAME = re.compile(r"projects-\d{4}-\d{2}-\d{2}\.json")
+KEEP_BACKUPS = 14
+LOCK_TIMEOUT = 15  # seconds; writers only hold the lock for milliseconds
+RESTORE_HINT = "Run `pm restore latest` to go back to the last backup, or `pm restore` to see them all."
 WEB = os.path.join(HERE, "web")
 GH_CACHE = os.path.join(HERE, ".cache", "github.json")
 GH_TTL = 600
@@ -56,22 +83,147 @@ def col(text, *styles):
 
 # ---------- storage ----------
 
+class DataError(Exception):
+    """Something is wrong with the data file; the message tells you what to do about it."""
+
+
+def backups():
+    """Backup file names, newest first."""
+    try:
+        return sorted((n for n in os.listdir(BACKUPS) if BACKUP_NAME.fullmatch(n)), reverse=True)
+    except OSError:
+        return []
+
+
 def load():
-    if not os.path.exists(DATA):
+    try:
+        with open(DATA, encoding="utf-8") as f:
+            db = json.load(f)
+        if not isinstance(db, dict) or not isinstance(db.get("projects", {}), dict):
+            raise ValueError("not a pm data file")
+    except FileNotFoundError:
+        # A first run has no backups. Backups without a data file mean it was deleted: don't show an empty board.
+        if backups():
+            raise DataError(f"Your data file is missing: {tilde(DATA)}. {RESTORE_HINT}") from None
         return json.loads(json.dumps(DEFAULTS))
-    with open(DATA, encoding="utf-8") as f:
-        db = json.load(f)
+    except ValueError as e:
+        hint = RESTORE_HINT if backups() else "There are no backups yet, so it needs fixing by hand."
+        raise DataError(f"Your data file is damaged: {tilde(DATA)} ({e}). {hint}") from None
+    except OSError as e:
+        raise DataError(f"Couldn't read {tilde(DATA)}: {e.strerror}") from None
     for k, v in DEFAULTS.items():
         db.setdefault(k, json.loads(json.dumps(v)))
     return db
 
 
+def copy_atomically(source, target):
+    """The target is either untouched or a complete copy, never half of one."""
+    tmp = f"{target}.{os.getpid()}.{threading.get_ident()}.tmp"
+    try:
+        shutil.copyfile(source, tmp)
+        os.replace(tmp, target)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+def back_up():
+    """One copy per day, taken before that day's first change. A backup problem never blocks the save."""
+    target = os.path.join(BACKUPS, f"projects-{today()}.json")
+    if os.path.exists(target) or not os.path.exists(DATA):
+        return
+    try:
+        os.makedirs(BACKUPS, exist_ok=True)
+        copy_atomically(DATA, target)
+        for old in backups()[KEEP_BACKUPS:]:
+            os.remove(os.path.join(BACKUPS, old))
+    except OSError as e:
+        print(col(f"Couldn't back up your data to {tilde(BACKUPS)}: {e.strerror}", "y"), file=sys.stderr)
+
+
 def save(db):
-    tmp = DATA + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(db, f, indent=2, ensure_ascii=False)
-        f.write("\n")
-    os.replace(tmp, DATA)
+    """Atomic, under a name of its own: a crash or another writer can't leave half a file behind."""
+    tmp = f"{DATA}.{os.getpid()}.{threading.get_ident()}.tmp"
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        back_up()
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(db, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, DATA)
+    except OSError as e:
+        raise DataError(f"Couldn't save {tilde(DATA)}: {e.strerror}") from None
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+def try_lock(f):
+    try:
+        if os.name == "nt":
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except OSError:
+        return False
+
+
+@contextmanager
+def data_lock():
+    """One writer at a time, across the board's threads and every `pm` process.
+
+    The OS drops the lock if its holder dies, so a crash can't leave it stuck. It isn't reentrant.
+    """
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        f = open(DATA + ".lock", "a+b")
+    except OSError as e:
+        raise DataError(f"Can't write to {tilde(DATA_DIR)}: {e.strerror}") from None
+    with f:
+        give_up = time.monotonic() + LOCK_TIMEOUT
+        while not try_lock(f):
+            if time.monotonic() > give_up:
+                raise DataError(f"Another pm process has been holding {tilde(DATA)} for {LOCK_TIMEOUT} seconds. Try again in a moment.")
+            time.sleep(0.01)
+        try:
+            yield
+        finally:
+            if os.name == "nt":
+                f.seek(0)
+                msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(f, fcntl.LOCK_UN)
+
+
+@contextmanager
+def editing():
+    """Load, change and save as one locked step, so nobody else's write can get lost."""
+    with data_lock():
+        db = load()
+        yield db
+        save(db)
+
+
+def adopt_old_data():
+    """Data used to live next to the script, where a fresh clone lost it. Copy it out once; the original stays as a spare."""
+    if os.path.exists(DATA) or not os.path.exists(OLD_DATA):
+        return
+    try:
+        with open(OLD_DATA, encoding="utf-8") as f:
+            json.load(f)
+    except (OSError, ValueError) as e:
+        raise DataError(f"Couldn't move your data out of {tilde(OLD_DATA)}, because it can't be read ({e}). Nothing was changed.") from None
+    try:
+        with data_lock():
+            if not os.path.exists(DATA):
+                copy_atomically(OLD_DATA, DATA)
+    except OSError as e:
+        raise DataError(f"Couldn't move your data to {tilde(DATA)}: {e.strerror}. Nothing was changed.") from None
+    print(f"Moved your data to {tilde(DATA)}. {tilde(OLD_DATA)} is no longer used, so you can delete it.", file=sys.stderr)
 
 
 def today():
@@ -102,7 +254,8 @@ NO_WINDOW = {"creationflags": 0x08000000} if os.name == "nt" else {}  # CREATE_N
 def git(path, *args):
     try:
         out = subprocess.run(["git", "-C", path, *args], capture_output=True, encoding="utf-8", errors="replace", timeout=10, **NO_WINDOW)
-        return out.stdout.strip() if out.returncode == 0 else ""
+        # Only the end: `status --porcelain` lines can start with a meaningful space.
+        return out.stdout.rstrip() if out.returncode == 0 else ""
     except (OSError, subprocess.TimeoutExpired):
         return ""
 
@@ -214,6 +367,16 @@ def sync(db, quiet=False):
     if new and not quiet:
         print(col(f"Found {len(new)} new project(s): ", "c") + ", ".join(new))
     return new
+
+
+def synced(quiet=True):
+    """The current data plus any newly found projects. It only writes when it found some,
+    so reading the board or running `pm` can't overwrite a save made in the meantime."""
+    db = load()
+    if sync(db, quiet=True):
+        with editing() as db:
+            sync(db, quiet)
+    return db
 
 
 def find(db, query):
@@ -344,7 +507,7 @@ def row(name, p, info, width):
 # ---------- commands ----------
 
 def cmd_status(db, args):
-    sync(db)
+    db = synced(quiet=False)
     projects = {n: p for n, p in db["projects"].items() if os.path.exists(p["path"])}
     infos = {n: activity(p["path"]) for n, p in projects.items()}
     width = max((len(n) for n in projects), default=10)
@@ -395,7 +558,6 @@ def cmd_status(db, args):
     for t in tips:
         print(col("\n» " + t, "y"))
     print()
-    save(db)
 
 
 def cmd_focus(db, args):
@@ -475,6 +637,7 @@ def cmd_idea(db, args):
 
 
 def cmd_ideas(db, args):
+    db = load()
     ideas = [idea_view(db, i) for i in db["ideas"] if i["status"] == "waiting"]
     if not ideas:
         print('No ideas waiting. Next time inspiration strikes: pm idea "..."')
@@ -518,7 +681,7 @@ def cmd_note(db, args):
 
 def cmd_show(db, args):
     need(args, 1, "show <name>")
-    name, p = find(db, args[0])
+    name, p = find(load(), args[0])
     info = activity(p["path"])
     days = idle_days(info)
     print(col(f"\n{name}", "bold") + ("  " + col("★ focus", "m") if p.get("focus") else "") + f"  [{p['status']}]")
@@ -548,7 +711,7 @@ def cmd_show(db, args):
 
 
 def cmd_list(db, args):
-    sync(db, quiet=True)
+    db = synced()
     want = args[0] if args else None
     for status in STATUSES:
         if want and status != want:
@@ -561,7 +724,6 @@ def cmd_list(db, args):
             p = db["projects"][n]
             print(("★ " if p.get("focus") else "  ") + n + (col("  → " + p["next"], "dim") if p.get("next") else ""))
     print()
-    save(db)
 
 
 def ask(prompt):
@@ -569,13 +731,16 @@ def ask(prompt):
         return input(prompt).strip()
     except (EOFError, KeyboardInterrupt):
         print()
-        save(DB_REF[0])
-        sys.exit(0)
+        sys.exit(0)  # every decision so far is already saved
 
 
 def cmd_review(db, args):
-    """Walk through stalled active projects one at a time and make a call on each."""
-    sync(db)
+    """Walk through stalled active projects one at a time and make a call on each.
+
+    A prompt can sit open for minutes while the board keeps saving, so nothing is held
+    across one: each decision is applied to the latest data and saved on its own.
+    """
+    db = synced(quiet=False)
     queue = []
     for n, p in db["projects"].items():
         if p["status"] != "active" or not os.path.exists(p["path"]):
@@ -590,7 +755,9 @@ def cmd_review(db, args):
         return
     print(col(f"\nWeekly review: {len(queue)} project(s). Enter to skip, q to quit.\n", "bold"))
     for d, n, info in queue:
-        p = db["projects"][n]
+        p = load()["projects"].get(n)
+        if not p or p["status"] != "active":  # removed or decided on the board in the meantime
+            continue
         print(col(n, "bold") + f"  {heat(d if d != 9999 else None)} {ago(d if d != 9999 else None)}"
               f"  ·  last: {info['subject'][:60] or '—'}")
         if p.get("why"):
@@ -601,24 +768,29 @@ def cmd_review(db, args):
         if choice == "q":
             break
         if choice == "f":
-            err = try_focus(db, n)
+            with editing() as db:
+                err = try_focus(db, n) if n in db["projects"] else None
             if err:
                 print(col(f"  {err} Kept instead.", "y"))
         elif choice in ("p", "d", "x"):
             status = {"p": "parked", "d": "dropped", "x": "done"}[choice]
-            change_status(p, status)
             note = ask("  one-line note (optional) > ")
-            log(p, f"{status} (review)" + (f": {note}" if note else ""))
+            with editing() as db:
+                q = db["projects"].get(n)
+                if q:
+                    change_status(q, status)
+                    log(q, f"{status} (review)" + (f": {note}" if note else ""))
             print()
             continue
         if choice in ("f", "k"):
             nxt = ask(f"  next step{' [' + p['next'] + ']' if p.get('next') else ''} > ")
             if nxt:
-                p["next"] = nxt
-                log(p, f"next: {nxt}")
-        save(db)
+                with editing() as db:
+                    q = db["projects"].get(n)
+                    if q:
+                        q["next"] = nxt
+                        log(q, f"next: {nxt}")
         print()
-    save(db)
     print(col("Review saved. Run `pm` to see the board.", "g"))
 
 
@@ -1032,9 +1204,7 @@ def local_detail(path):
 
 
 def board(refresh=False):
-    db = load()
-    sync(db, quiet=True)
-    save(db)
+    db = synced()
     projects = {n: p for n, p in db["projects"].items() if os.path.exists(p["path"])}
     def scan(n):
         p = projects[n]
@@ -1096,7 +1266,7 @@ def settings_view(db):
                       "nested": same_path(root, db["nested"]),
                       "projects": sorted(names.get(norm(p), n) for n, p in found.items())})
     return {"roots": roots, "ignore": db["ignore"], "focusLimit": db["focus_limit"],
-            "ideaCooldown": db["idea_cooldown_days"]}
+            "ideaCooldown": db["idea_cooldown_days"], "dataFile": tilde(DATA)}
 
 
 def preview_root(path, nested):
@@ -1173,12 +1343,29 @@ root.withdraw()
 root.attributes("-topmost", True)
 print(tkinter.filedialog.askdirectory(parent=root, title="Choose a project folder", initialdir=sys.argv[1]) or "")"""
 
+# Homebrew's Python has no tkinter, so macOS uses its own open panel. AppKit's constants reach
+# JavaScript as strings here, hence == rather than ===.
+PICKER_MAC = """ObjC.import("AppKit");
+function run(argv) {
+  const app = $.NSApplication.sharedApplication;
+  app.setActivationPolicy($.NSApplicationActivationPolicyAccessory);
+  app.activateIgnoringOtherApps(true);
+  const panel = $.NSOpenPanel.openPanel;
+  panel.canChooseFiles = false;
+  panel.canChooseDirectories = true;
+  panel.message = "Choose a project folder";
+  panel.directoryURL = $.NSURL.fileURLWithPath(argv[0]);
+  return panel.runModal == $.NSModalResponseOK ? panel.URL.path.js : "";
+}"""
+
 
 def pick_folder():
     """A native folder dialog, in its own process: Tk wants a main thread and the server's is busy."""
+    home = os.path.expanduser("~")
+    argv = (["osascript", "-l", "JavaScript", "-e", PICKER_MAC, home] if sys.platform == "darwin"
+            else [sys.executable, "-c", PICKER, home])
     try:
-        out = subprocess.run([sys.executable, "-c", PICKER, os.path.expanduser("~")],
-                             capture_output=True, encoding="utf-8", timeout=600, **NO_WINDOW)
+        out = subprocess.run(argv, capture_output=True, encoding="utf-8", timeout=600, **NO_WINDOW)
     except (OSError, subprocess.TimeoutExpired):
         out = None
     if not out or out.returncode != 0:
@@ -1230,7 +1417,6 @@ def cmd_serve(db, args):
         sys.stdout = sys.stderr = open(args[args.index("--log") + 1], "a", encoding="utf-8", buffering=1)
     allowed = {f"127.0.0.1:{port}", f"localhost:{port}"}
     types = {".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".svg": "image/svg+xml"}
-    write_lock = threading.Lock()
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *a):
@@ -1252,7 +1438,19 @@ def cmd_serve(db, args):
             origin = self.headers.get("Origin")
             return origin is None or urlparse(origin).netloc in allowed
 
+        def reporting_data_errors(self, handler):
+            try:
+                handler()
+            except DataError as e:
+                self.send(500, {"error": str(e)})
+
         def do_GET(self):
+            self.reporting_data_errors(self.get)
+
+        def do_POST(self):
+            self.reporting_data_errors(self.post)
+
+        def get(self):
             if not self.trusted():
                 return self.send(403, {"error": "forbidden"})
             url = urlparse(self.path)
@@ -1272,7 +1470,7 @@ def cmd_serve(db, args):
             with open(file, "rb") as f:
                 self.send(200, f.read(), types.get(os.path.splitext(name)[1], "application/octet-stream"))
 
-        def do_POST(self):
+        def post(self):
             if not self.trusted() or self.headers.get("Content-Type") != "application/json":
                 return self.send(403, {"error": "forbidden"})
             path = urlparse(self.path).path
@@ -1280,7 +1478,7 @@ def cmd_serve(db, args):
             idea = re.fullmatch(r"/api/ideas(?:/(\d+))?", path)
             settings = path == "/api/settings"
             if path == "/api/pick-folder":
-                return self.send(*pick_folder())  # waits on the person, so outside the write lock
+                return self.send(*pick_folder())  # waits on the person, so outside the lock
             if not m and not idea and not settings and path != "/api/projects":
                 return self.send(404, {"error": "not found"})
             try:
@@ -1289,7 +1487,7 @@ def cmd_serve(db, args):
                     task = (int(body["line"]), str(body["text"]), bool(body["done"]))
             except (ValueError, KeyError, TypeError, AttributeError):
                 return self.send(400, {"error": "bad request"})
-            with write_lock:
+            with data_lock():
                 if settings:
                     self.send(*save_settings(body))
                 elif not m and not idea:
@@ -1662,6 +1860,44 @@ def cmd_autostart(db, args):
         sys.exit("usage: pm autostart [on [port] | off | status]")
 
 
+def cmd_restore(db, args):
+    """List the backups, or go back to one. The file being replaced is kept, in case it's the one you wanted."""
+    found = backups()
+    if not found:
+        return print("No backups yet. pm takes one before the first change of each day.")
+    if not args:
+        print(col("Backups, newest first:", "bold"))
+        for name in found:
+            try:
+                with open(os.path.join(BACKUPS, name), encoding="utf-8") as f:
+                    about = plural(len(json.load(f)["projects"]), "project")
+            except (OSError, ValueError, KeyError, TypeError):
+                about = col("damaged", "r")
+            print(f"  {name[len('projects-'):-len('.json')]}  {about}")
+        return print(col("\nGo back to one with: pm restore <date>, or pm restore latest", "dim"))
+    name = found[0] if args[0] == "latest" else f"projects-{args[0]}.json"
+    if name not in found:
+        sys.exit(f"No backup from {args[0]}. Run `pm restore` to see them.")
+    source = os.path.join(BACKUPS, name)
+    try:
+        with open(source, encoding="utf-8") as f:
+            json.load(f)["projects"]
+    except (OSError, ValueError, KeyError, TypeError):
+        sys.exit(col(f"The backup {name} is damaged. Run `pm restore` to pick another.", "r"))
+    try:
+        with data_lock():
+            kept = None
+            if os.path.exists(DATA):
+                kept = f"{DATA}.before-restore-{datetime.now():%Y%m%d-%H%M%S}"
+                copy_atomically(DATA, kept)
+            copy_atomically(source, DATA)
+    except OSError as e:
+        raise DataError(f"Couldn't restore {tilde(DATA)}: {e.strerror}. Nothing was changed.") from None
+    print(col(f"✓ Restored the backup from {name[len('projects-'):-len('.json')]}.", "g"))
+    if kept:
+        print(col(f"  The file it replaced is kept at {tilde(kept)}", "dim"))
+
+
 HELP = """pm — keep your projects from quietly dying
 
   pm                      the board: focus, in motion, stalled
@@ -1691,6 +1927,7 @@ HELP = """pm — keep your projects from quietly dying
   pm add <path> [name]    track a folder that isn't auto-discovered
   pm root <dir>           add a folder to scan
   pm ignore <name>        stop tracking something
+  pm restore [date|latest]  list the daily backups, or go back to one
 
 Names can be abbreviated: `pm show grim`."""
 
@@ -1704,8 +1941,13 @@ COMMANDS = {
     "park": set_status("parked", "park"), "drop": set_status("dropped", "drop"),
     "done": set_status("done", "done"), "revive": set_status("active", "revive"),
     "show": cmd_show, "list": cmd_list, "add": cmd_add, "root": cmd_root, "ignore": cmd_ignore,
+    "restore": cmd_restore,
 }
-DB_REF = [None]
+
+# Slow, long-running or independent of the data: these can't hold the lock all that time, so
+# they get no snapshot and fetch what they need. Every other command is one quick locked edit.
+UNLOCKED = {cmd_status, cmd_review, cmd_list, cmd_show, cmd_ideas, cmd_restore,
+            cmd_serve, cmd_start, cmd_stop, cmd_tray, cmd_autostart}
 
 
 def main():
@@ -1717,9 +1959,16 @@ def main():
     cmd = args[0] if args else "status"
     if cmd not in COMMANDS:
         sys.exit(f"Unknown command '{cmd}'.\n\n{HELP}")
-    db = load()
-    DB_REF[0] = db
-    COMMANDS[cmd](db, args[1:])
+    run = COMMANDS[cmd]
+    try:
+        adopt_old_data()
+        if run in UNLOCKED:
+            run(None, args[1:])
+        else:
+            with data_lock():
+                run(load(), args[1:])
+    except DataError as e:
+        sys.exit(col(str(e), "r"))
 
 
 if __name__ == "__main__":

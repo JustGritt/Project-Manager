@@ -128,7 +128,7 @@ pm tray off
 pm autostart off
 ```
 
-Then delete the `Project-Manager` folder, plus the `~/.local/bin/pm` link on macOS or the PATH entry on Windows. Your data is in `projects.json` inside that folder, so copy it first if you want to keep your notes.
+Then delete the `Project-Manager` folder, plus the `~/.local/bin/pm` link on macOS or the PATH entry on Windows. Your notes stay in the [data folder](#data), so delete that too if you want them gone.
 
 ## Web board
 
@@ -215,10 +215,25 @@ pm show <name>          details, roadmap, recent commits, journal
 pm list [status]
 pm roadmap <name> [file]
 pm add <path> [name] · pm root <dir> · pm ignore <name>
+pm restore [date|latest]  list the daily backups, or go back to one
 ```
 
 Names can be abbreviated: `pm show grim`.
 
 ## Data
 
-Everything you enter lives in `projects.json` next to the script (git-ignored). GitHub responses are cached for 10 minutes in `.cache/`.
+Everything you enter lives in `projects.json`, in a folder outside the repo so that deleting or recloning it can't lose your notes:
+
+| | |
+|---|---|
+| macOS | `~/Library/Application Support/pm/` |
+| Linux | `~/.local/share/pm/`, or `$XDG_DATA_HOME/pm/` |
+| Windows | `%APPDATA%\pm\` |
+
+If an older version kept `projects.json` next to the script, `pm` copies it to this folder the first time it runs. The old file is then unused, and you can delete it.
+
+**Backups:** before the first change of each day, pm copies the file into `backups/` in that folder and keeps the latest 14. `pm restore` lists them, and `pm restore latest` or `pm restore <date>` goes back to one, keeping a copy of the file it replaces.
+
+The CLI and the board can safely run at the same time: each save takes a lock and works from the latest data.
+
+GitHub responses are cached for 10 minutes in `.cache/`.

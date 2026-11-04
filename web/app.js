@@ -22,8 +22,10 @@ async function load(refresh = false) {
   if (refresh) btn.textContent = 'Syncing…';
   try {
     const res = await fetch('/api/board' + (refresh ? '?refresh=1' : ''));
-    if (!res.ok) throw new Error(res.statusText);
-    state.data = await res.json();
+    const data = await res.json();
+    // A damaged data file has to stay on screen; a toast would fade and leave a blank page.
+    if (!res.ok) return showLoadError(data.error || res.statusText);
+    state.data = data;
     render();
   } catch {
     toast('Could not reach pm. Is `pm serve` still running?', true);
@@ -31,6 +33,11 @@ async function load(refresh = false) {
     btn.disabled = false;
     btn.textContent = 'Sync GitHub';
   }
+}
+
+function showLoadError(msg) {
+  $('#sub').textContent = "Couldn't load your projects";
+  $('#app').innerHTML = `<p class="s-error" role="alert">${esc(msg)}</p>`;
 }
 
 // POST JSON; returns the response body, or null after showing the error.
@@ -67,13 +74,28 @@ async function pickFolder(btn) {
   const res = await postInline('/api/pick-folder', {});
   btn.disabled = false;
   btn.textContent = label;
-  if (res.error) return toast(res.error, true);
+  if (res.error) return showPickError(btn, input, res.error);
   if (res.path) {
     input.value = res.path;
     input.dispatchEvent(new Event('input', { bubbles: true }));
   }
   input.focus();
 }
+
+// Browse only exists inside dialogs, where a toast would be hidden behind the modal.
+function showPickError(btn, input, msg) {
+  if (btn.closest('#settings')) {
+    const typed = input.value;
+    settings.error = msg;
+    renderSettings();
+    $('[data-s-add] [name="path"]', sdlg).value = typed;
+  } else {
+    const err = $('.s-error', adlg);
+    err.textContent = msg;
+    err.hidden = false;
+  }
+}
+
 document.addEventListener('click', (e) => {
   const btn = e.target.closest('[data-pick]');
   if (btn) pickFolder(btn);
@@ -1082,7 +1104,7 @@ function renderSettings() {
   sdlg.innerHTML = `
     <div class="d-head">
       <div class="d-title"><h2 id="settings-title">Settings</h2><button class="close-x" data-s="close" aria-label="Close">×</button></div>
-      <div class="d-meta">Saved in projects.json next to pm.</div>
+      <div class="d-meta">Saved in ${esc(s.dataFile)}, with daily backups.</div>
     </div>
     <div class="d-body">
       <section>
